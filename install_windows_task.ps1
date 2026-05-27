@@ -19,7 +19,7 @@ Register-ScheduledTask `
   -Action $Action `
   -Trigger $Trigger `
   -Settings $Settings `
-  -Description "Envia o resumo cripto diario da Messari por Telegram as 07:10." `
+  -Description "Envia o resumo cripto diario atualizado por Telegram as 07:10." `
   -Force | Out-Null
 
 Write-Host "Scheduled task installed: $TaskName"

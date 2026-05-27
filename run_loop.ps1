@@ -31,22 +31,22 @@ function Get-NextRun {
 
 function Invoke-DailyAgent {
   $startedAt = Get-Date
-  Write-Host "[$($startedAt.ToString('yyyy-MM-dd HH:mm:ss'))] Running Messari daily agent..."
+  Write-Host "[$($startedAt.ToString('yyyy-MM-dd HH:mm:ss'))] Running crypto daily agent..."
 
-  python .\messari_daily_agent.py --send-telegram
+  python .\crypto_daily_agent.py --send-telegram
   $exitCode = $LASTEXITCODE
 
   if ($exitCode -eq 0) {
     Write-Host "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] Done."
   } else {
-    Write-Warning "Messari daily agent exited with code $exitCode. The loop will keep running."
+    Write-Warning "Crypto daily agent exited with code $exitCode. The loop will keep running."
   }
 
   return $startedAt
 }
 
 $lastRun = $null
-Write-Host "BotMessari dev loop started. Daily run time: $At. Press Ctrl+C to stop."
+Write-Host "BotMessari crypto dev loop started. Daily run time: $At. Press Ctrl+C to stop."
 
 if ($RunImmediately) {
   $lastRun = Invoke-DailyAgent

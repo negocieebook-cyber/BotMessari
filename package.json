@@ -2,12 +2,12 @@
   "name": "botmessari",
   "version": "1.0.0",
   "private": true,
-  "description": "Agente diario da Messari com envio por Telegram.",
+  "description": "Agente diario cripto com envio por Telegram.",
   "scripts": {
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\run_loop.ps1 -RunImmediately",
     "once": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\run_daily.ps1",
     "start": "npm run dev",
-    "test": "python -c \"import ast, pathlib; ast.parse(pathlib.Path('messari_daily_agent.py').read_text(encoding='utf-8')); print('python syntax ok')\"",
+    "test": "python -c \"import ast, pathlib; ast.parse(pathlib.Path('crypto_daily_agent.py').read_text(encoding='utf-8')); print('python syntax ok')\"",
     "schedule": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\install_windows_task.ps1"
   }
 }
