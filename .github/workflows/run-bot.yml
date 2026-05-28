@@ -1,9 +1,11 @@
-name: BotMessari - Daily Run
+name: BotMessari - Runs
 
 on:
   schedule:
-    # Diário às 07:10 BRT (= 10:10 UTC)
+    # Diário às 07:10 BRT (= 10:10 UTC) — TODOS os dias
     - cron: '10 10 * * *'
+    # Semanal aos domingos às 08:00 BRT (= 11:00 UTC)
+    - cron: '0 11 * * 0'
   workflow_dispatch:
 
 jobs:
@@ -21,6 +23,7 @@ jobs:
         run: pip install beautifulsoup4
 
       - name: Run daily agent
+        if: github.event.schedule == '10 10 * * *' || github.event_name == 'workflow_dispatch'
         env:
           MESSARI_API_KEY: ${{ secrets.MESSARI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -29,3 +32,14 @@ jobs:
           COINMARKETCAP_API_KEY: ${{ secrets.COINMARKETCAP_API_KEY }}
           CRYPTORANK_API_KEY: ${{ secrets.CRYPTORANK_API_KEY }}
         run: python crypto_daily_agent.py --send-telegram --daily
+
+      - name: Run weekly agent
+        if: github.event.schedule == '0 11 * * 0' || github.event_name == 'workflow_dispatch'
+        env:
+          MESSARI_API_KEY: ${{ secrets.MESSARI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINMARKETCAP_API_KEY: ${{ secrets.COINMARKETCAP_API_KEY }}
+          CRYPTORANK_API_KEY: ${{ secrets.CRYPTORANK_API_KEY }}
+        run: python crypto_daily_agent.py --send-telegram --weekly
