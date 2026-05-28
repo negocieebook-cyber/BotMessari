@@ -1,0 +1,31 @@
+name: BotMessari - Daily Run
+
+on:
+  schedule:
+    # Diário às 07:10 BRT (= 10:10 UTC)
+    - cron: '10 10 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install beautifulsoup4
+
+      - name: Run daily agent
+        env:
+          MESSARI_API_KEY: ${{ secrets.MESSARI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINMARKETCAP_API_KEY: ${{ secrets.COINMARKETCAP_API_KEY }}
+          CRYPTORANK_API_KEY: ${{ secrets.CRYPTORANK_API_KEY }}
+        run: python crypto_daily_agent.py --send-telegram --daily
