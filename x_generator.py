@@ -52,9 +52,15 @@ NEWS_RSS: list[tuple[str, str]] = [
 ]
 
 # Canais gringos curados (usuario: galera EUA/gringa com info solida)
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
 YT_CHANNELS: list[tuple[str, str]] = [
     ("Coin Bureau", "UCqK_GSMbpiV8spgD3ZGloSw"),
     ("Benjamin Cowen", "UCRvqjQPSeaWn-uEx-w0XOIg"),
+    ("Glassnode", "UCDq7GjSes-8kQn_Vcg35jfA"),  # on-chain / whale / ETF flows
 ]
 
 # Influencers do X (best-effort via RSSHub; se falhar, seguem sem eles)
@@ -65,8 +71,13 @@ INFLUENCER_X: list[str] = [
     "MilesDeutscher",    # pesquisa/narrativas
     "RyanWatkins_",      # Messari research
     "aeyakovenko",       # Solana co-founder
+    "FarsideUK",         # fluxo diario de ETF institucional
+    "lookonchain",       # baleias / smart money on-chain
+    "glassnode",         # analise on-chain / whale
 ]
 
+# Lookonchain: feed proprio de baleias/smart money (parseavel sem API)
+LOOKONCHAIN_URL = "https://www.lookonchain.com/feeds"
 RSSHUB_BASE = "https://rsshub.app"
 
 # Alias para detectar moedas mencionadas em titulos/trechos (canonico -> palavras)
@@ -310,6 +321,61 @@ def yt_video_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def flow_magnitude_usdm(text: str) -> float:
+    """Maior valor em USD presente no texto (para ponderar momentum de fluxo/baleia)."""
+    t = text.replace("US$", "$")
+    mult = {
+        "k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12,
+        "thousand": 1e3, "million": 1e6, "billion": 1e9, "trillion": 1e12,
+    }
+    best = 0.0
+    for mt in re.finditer(r"(\d+(?:\.\d+)?)\s*(k|m|b|t|million|billion|thousand)", t, re.I):
+        try:
+            val = float(mt.group(1)) * mult[mt.group(2).lower()]
+            if val > best:
+                best = val
+        except (ValueError, KeyError):
+            pass
+    for mt in re.finditer(r"\$\s?(\d+(?:\.\d+)?)", t):
+        try:
+            v = float(mt.group(1))
+            if v > best:
+                best = v
+        except ValueError:
+            pass
+    return best
+
+
+def parse_lookonchain(limit: int = 12) -> list[NewsItem]:
+    """Feed proprio da Lookonchain (baleias / smart money / fluxos). Parse direto, sem API."""
+    result = http_request("GET", LOOKONCHAIN_URL, timeout=30, headers={"User-Agent": BROWSER_UA})
+    if not result.ok or not isinstance(result.data, str):
+        return []
+    txt = unescape(result.data)
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    txt = txt.replace("&quot;", '"').replace("&#39;", "'")
+    sentences = re.split(r"(?<=[.!])\s+", txt)
+    seen: set[str] = set()
+    items: list[NewsItem] = []
+    keyword = re.compile(r"\b(whale|funds\s+(?:flowed|flow|have flown|into)|inflow|outflow|ETF|liquidat|"
+                         r"transferred|short|long|profit|bought|sold|burn|mint)\b", re.I)
+    has_money = re.compile(r"(?:US)?\$\s?\d|million|billion|^[0-9.]+ ?[KMBT]")
+    for s in sentences:
+        s = re.sub(r"\s+", " ", s).strip()
+        if not (40 < len(s) < 240):
+            continue
+        if not keyword.search(s) or not has_money.search(s):
+            continue
+        key = s.lower()[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(NewsItem("Lookonchain", s, LOOKONCHAIN_URL, "", "flow"))
+        if len(items) >= limit:
+            break
+    return items
+
+
 def fetch_youtube_transcript(vid: str) -> str | None:
     """Transcricao de um video do YouTube (requer pacote youtube-transcript-api)."""
     try:
@@ -400,39 +466,54 @@ class Topic:
 
 def cross_reference(all_items: list[NewsItem], trend_map: dict[str, str]) -> list[Topic]:
     """
-    Cruza: noticias + youtube + influencers + trending do CoinGecko.
-    Um tema so sobe se bater em multiplas fontes independentes (score de confluencia).
+    Cruza noticias + youtube + influencers + fluxos (Lookonchain) + trending.
+    O score e por MOMENTUM: pesa a magnitude em $ dos fluxos de baleias/institucional,
+    a diversidade de fontes e o peso de cada tipo de sinal.
     """
     by_coin: dict[str, dict[str, int]] = {}
     items_by_coin: dict[str, list[NewsItem]] = {}
+    momentum: dict[str, float] = {}
     for item in all_items:
-        for coin in detect_coins(item.title):
+        coins = detect_coins(item.title)
+        if not coins:
+            continue
+        w = 1.0
+        if item.kind == "flow":
+            mag = flow_magnitude_usdm(item.title)
+            w = 3.0 if mag < 10_000_000 else (6.0 if mag < 100_000_000 else 10.0)
+        elif item.kind == "youtube":
+            w = 1.5
+        elif item.kind == "influencer":
+            w = 1.2
+        for coin in coins:
             by_coin.setdefault(coin, {}).setdefault(item.source, 0)
             by_coin[coin][item.source] += 1
+            momentum[coin] = momentum.get(coin, 0.0) + w
             items_by_coin.setdefault(coin, []).append(item)
 
     topics: list[Topic] = []
-    for coin, scores in by_coin.items():
-        # bonus: tambem esta no top trending do CoinGecko?
+    for coin, mom in momentum.items():
+        scores = by_coin[coin]
         trend_rank = None
         for i, (tid, tname) in enumerate(trend_map.items()):
             if coin.lower() in (str(tname or "").lower(), tid.lower()):
                 trend_rank = i + 1
-                scores["CoinGecko Trending"] = max(scores.get("CoinGecko Trending", 0), 1)
+                scores.setdefault("CoinGecko Trending", 1)
+                # bonus maior quanto mais topo estiver no trending
+                mom += 2.5 / max(1, min(trend_rank, 10))
                 break
-        total = sum(scores.values())
-        if total <= 0:
+        if int(mom) <= 0:
             continue
         topics.append(
             Topic(
                 coin=coin,
                 scores=scores,
                 items=sorted(items_by_coin[coin], key=lambda it: it.published, reverse=True),
-                total_score=total,
+                total_score=int(mom),
                 trend_rank=trend_rank,
             )
         )
-    topics.sort(key=lambda t: (t.total_score, t.trend_rank is not None), reverse=True)
+    topics.sort(key=lambda t: t.total_score, reverse=True)
     return topics
 
 
@@ -449,7 +530,7 @@ def build_context(topic: Topic, trend_map: dict[str, str]) -> str:
     lines.append(f"FONTES QUE FALAM DISSO: {src}")
     lines.append("HEADLINES / TWEETS / VIDEOS DE HOJE:")
     for it in topic.items[:6]:
-        tag = {"news": "NOTICIA", "youtube": "VIDEO", "influencer": "TWEET"}[it.kind]
+        tag = {"news": "NOTICIA", "youtube": "VIDEO", "influencer": "TWEET", "flow": "FLUXO"}[it.kind]
         lines.append(f"[{tag}/{it.source}] {it.title}  ({it.url})")
 
     # Transcricao real dos videos do YouTube que falam da moeda
@@ -623,6 +704,9 @@ def main() -> int:
         items = parse_youtube_feed(cid, cname)
         print(f"  [yt] {cname}: {len(items)} videos")
         all_items.extend(items)
+    flow_items = parse_lookonchain()
+    print(f"  [flow] Lookonchain: {len(flow_items)} movimentos de baleia/fluxo")
+    all_items.extend(flow_items)
     if args.include_x:
         for handle in INFLUENCER_X:
             items = parse_twitter_feed(handle)
