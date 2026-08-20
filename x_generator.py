@@ -208,15 +208,32 @@ def env_value(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+def env_status(name: str) -> str:
+    """Diagnostico: ok / ausente / placeholder. NAO expoe a chave."""
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return "AUSENTE (nao encontrada no .env)"
+    low = v.lower()
+    placeholders = ("sua-", "your-", "your_", "coloque", "placeh", "xxxx", "***", "token-do-seu", "seu-chat")
+    if any(p in low for p in placeholders):
+        return "PLACEHOLDER (parece texto de exemplo, nao chave real)"
+    return "ok"
+
+
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    try:
+        # utf-8-sig remove o BOM que o Notepad coloca no inicio do arquivo
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except UnicodeDecodeError:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines:
+        line = line.strip().lstrip("\ufeff")
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        key = key.strip()
+        key = key.strip().strip("\ufeff")
         value = value.strip().strip("\"'")
         if key and key not in os.environ:
             os.environ[key] = value
@@ -850,6 +867,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     load_env_file(Path(".env"))
+    print("  [env] MESSARI_API_KEY:", env_status("MESSARI_API_KEY"))
+    print("  [env] OPENROUTER_API_KEY:", env_status("OPENROUTER_API_KEY"))
+    print("  [env] TELEGRAM_BOT_TOKEN:", env_status("TELEGRAM_BOT_TOKEN"))
+    print("  [env] TELEGRAM_CHAT_ID:", env_status("TELEGRAM_CHAT_ID"))
     args = parse_args()
     env = dict(os.environ)
 
