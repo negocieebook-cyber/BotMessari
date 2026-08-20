@@ -82,9 +82,9 @@ RSSHUB_BASE = "https://rsshub.app"
 
 # Alias para detectar moedas mencionadas em titulos/trechos (canonico -> palavras)
 COIN_ALIASES: dict[str, list[str]] = {
-    "Bitcoin": ["bitcoin", "btc", "#btc"],
-    "Ethereum": ["ethereum", "eth", "#eth"],
-    "Solana": ["solana", "sol", "#sol"],
+    "Bitcoin": ["bitcoin", "btc ", "#btc"],
+    "Ethereum": ["ethereum", "eth ", "#eth"],
+    "Solana": ["solana", "sol ", "#sol"],
     "Dogecoin": ["dogecoin", "doge"],
     "Shiba Inu": ["shiba", "shib"],
     "Pepe": ["pepe", "$pepe"],
@@ -96,6 +96,44 @@ COIN_ALIASES: dict[str, list[str]] = {
     "Avalanche": ["avalanche", "avax"],
     "Bonk": ["bonk", "$bonk"],
     "Dogwifhat": ["wif", "dogwifhat"],
+    # Stablecoins / pecas centrais do mundo real
+    "USDC": ["usdc", "circle", "usd coin"],
+    "Tether": ["tether", "usdt"],
+    # Protocolos em destaque (DeFi / infra)
+    "Aave": ["aave"],
+    "Uniswap": ["uniswap"],
+    "Lido": ["lido"],
+    "Ethena": ["ethena", "usde"],
+    "MakerDAO": ["makerdao", "sky ecosystem"],
+    "Pendle": ["pendle"],
+    "Hyperliquid": ["hyperliquid", "hype"],
+    "EigenLayer": ["eigenlayer", "einstein"],
+    "LayerZero": ["layerzero"],
+    "Jupiter": ["jupiter", "jup"],
+    "Ondo": ["ondo"],  # RWA / real-world assets
+    "Sui": ["sui"],
+    "TON": ["ton "],
+    "Base": ["base chain", "base network"],  # L2
+    "Arbitrum": ["arbitrum", "arb "],
+}
+
+# Padrao para detectar noticias de captacao / VC funding (onde VCs poe grana)
+FUNDING_RE = re.compile(
+    r"\b(raises?|raised|funding|fundraise|round|seed|series [ab]|led by|vc\b|venture|"
+    r"backed by|secures|invests?|investment|tranche|valuation)\b",
+    re.I,
+)
+
+# Temas do "mundo cripto" alem de moedas: stablecoins/RWA e captacao/VC
+STABLE_RWA_RE = re.compile(
+    r"\b(stablecoin|stable coin|usdc|usdt|tether|circle|rwa|real[- ]?world|tokeniz|"
+    r"payment|stablecoins|regulation|sec\b|etf|institutional)\b",
+    re.I,
+)
+THEME_LABELS: dict[str, str] = {
+    "VC Funding": r"\b(raises?|raised|funding|fundraise|round|seed|series|led by|backed by|vc\b|venture|investment)\b",
+    "Stablecoins & RWA": r"\b(stablecoin|stable coin|usdc|usdt|tether|circle|rwa|real[- ]?world|tokeniz|payment)\b",
+    "Regulação & Institucional": r"\b(sec\b|etf|regulation|congress|institutional|approval|cftc|court|ruling)\b",
 }
 
 # Formulas de gancho (virais). A IA reescreve; isso e fallback/derivacao.
@@ -485,6 +523,11 @@ def cross_reference(all_items: list[NewsItem], trend_map: dict[str, str]) -> lis
             w = 1.5
         elif item.kind == "influencer":
             w = 1.2
+        elif item.kind == "news":
+            # noticias de funding/VC (onde os VCs estao colocando grana) ganham peso
+            if FUNDING_RE.search(item.title):
+                mag = flow_magnitude_usdm(item.title)
+                w = 2.5 if mag < 10_000_000 else (3.5 if mag < 100_000_000 else 5.0)
         for coin in coins:
             by_coin.setdefault(coin, {}).setdefault(item.source, 0)
             by_coin[coin][item.source] += 1
@@ -515,6 +558,58 @@ def cross_reference(all_items: list[NewsItem], trend_map: dict[str, str]) -> lis
         )
     topics.sort(key=lambda t: t.total_score, reverse=True)
     return topics
+
+
+def build_themes(all_items: list[NewsItem]) -> list[Topic]:
+    """
+    Temas do 'mundo cripto' que extrapolam moedas: captacao/VC, stablecoins/RWA,
+    regulacao/institucional. Entram no ranking de momentum junto com os assuntos por token.
+    """
+    buckets: dict[str, list[NewsItem]] = {label: [] for label in THEME_LABELS}
+    compiled = {label: re.compile(pat, re.I) for label, pat in THEME_LABELS.items()}
+    for it in all_items:
+        for label, rx in compiled.items():
+            if rx.search(it.title):
+                buckets[label].append(it)
+
+    out: list[Topic] = []
+    for label, its in buckets.items():
+        if not its:
+            continue
+        wsum = 0.0
+        srcs: dict[str, int] = {}
+        for it in its[:10]:
+            base = 1.0
+            if it.kind == "flow":
+                base = 4.0
+            elif it.kind == "news":
+                base = 2.0
+            mag = flow_magnitude_usdm(it.title)
+            if mag >= 100_000_000:
+                base += 3.0
+            elif mag >= 10_000_000:
+                base += 1.5
+            wsum += base
+            srcs[it.source] = srcs.get(it.source, 0) + 1
+        out.append(
+            Topic(
+                coin=label,
+                scores=srcs,
+                items=its[:8],
+                total_score=min(int(wsum), 40),  # cap p/ nao dominar so por agregacao
+                trend_rank=None,
+            )
+        )
+    out.sort(key=lambda t: t.total_score, reverse=True)
+    return out
+
+
+def merge_and_sort(*lists: list[Topic]) -> list[Topic]:
+    merged: list[Topic] = []
+    for lst in lists:
+        merged.extend(lst)
+    merged.sort(key=lambda t: t.total_score, reverse=True)
+    return merged
 
 
 # ----------------------------------------------------------------------------
@@ -721,7 +816,7 @@ def main() -> int:
         print("Nenhuma fonte retornou dados. Verifique a rede.", file=sys.stderr)
         return 1
 
-    topics = cross_reference(all_items, trend_map)
+    topics = merge_and_sort(cross_reference(all_items, trend_map), build_themes(all_items))
 
     if not topics:
         print("Nenhum tema com confluencia suficiente hoje.", file=sys.stderr)
