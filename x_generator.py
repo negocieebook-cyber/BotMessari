@@ -400,6 +400,8 @@ def parse_lookonchain(limit: int = 12) -> list[NewsItem]:
     has_money = re.compile(r"(?:US)?\$\s?\d|million|billion|^[0-9.]+ ?[KMBT]")
     for s in sentences:
         s = re.sub(r"\s+", " ", s).strip()
+        # remove prefixo de data/hora que vem em alguns feeds da Lookonchain
+        s = re.sub(r"^\d{4}\.\d{2}\.\d{2}[ T]\d{2}:\d{2}(:\d{2})?\s*", "", s)
         if not (40 < len(s) < 240):
             continue
         if not keyword.search(s) or not has_money.search(s):
@@ -649,28 +651,45 @@ def build_context(topic: Topic, trend_map: dict[str, str]) -> str:
 
 
 def llm_chat(env: dict[str, str], system: str, user: str) -> str | None:
-    """Tenta LLM OpenAI-compatible (OPENROUTER), depois Messari AI, senao None."""
+    """Tenta LLM OpenAI-compatible (OPENROUTER, varios modelos), depois Messari AI, senao None."""
     key = env.get("OPENROUTER_API_KEY")
     if key:
-        model = env.get("X_POST_MODEL") or "openai/gpt-4o-mini"
-        result = http_request(
-            "POST",
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            payload={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.8,
-            },
-        )
-        if result.ok and isinstance(result.data, dict):
-            content = (result.data.get("choices") or [{}])[0].get("message", {}).get("content")
-            if content:
-                return str(content).strip()
-        print(f"  [openrouter] falhou: {result.error}", file=sys.stderr)
+        models = [
+            env.get("X_POST_MODEL"),
+            "openai/gpt-4o-mini",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "openai/gpt-3.5-turbo",
+        ]
+        models = [m for m in models if m]
+        for model in models:
+            result = http_request(
+                "POST",
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                payload={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "temperature": 0.85,
+                },
+                timeout=60,
+            )
+            if result.ok and isinstance(result.data, dict):
+                content = (result.data.get("choices") or [{}])[0].get("message", {}).get("content")
+                if content and str(content).strip():
+                    return str(content).strip()
+                # sucesso mas vazio -> tenta proximo
+                print(f"  [openrouter:{model}] resposta vazia", file=sys.stderr)
+                continue
+            detail = result.error or f"status {result.status}"
+            # tenta extrair mensagem do corpo de erro
+            if isinstance(result.data, dict):
+                err = result.data.get("error") or {}
+                if isinstance(err, dict):
+                    detail = err.get("message") or detail
+            print(f"  [openrouter:{model}] falhou: {detail}", file=sys.stderr)
 
     messari_key = env.get("MESSARI_API_KEY")
     if messari_key:
@@ -687,7 +706,7 @@ def llm_chat(env: dict[str, str], system: str, user: str) -> str | None:
         )
         if result.ok and isinstance(result.data, dict):
             content = (result.data.get("choices") or [{}])[0].get("message", {}).get("content")
-            if content:
+            if content and str(content).strip():
                 return str(content).strip()
         print(f"  [messari ai] falhou: {result.error}", file=sys.stderr)
     return None
@@ -702,6 +721,14 @@ SYSTEM_PROMPT = (
     "'this never happens by chance', 'worth asking what everyone is missing', 'I like the coin'.\n"
     "- Sound like a person who noticed ONE concrete thing and shares it with a light, genuine opinion.\n"
     "- Use only facts that appear in the context. If there's no solid fact, reply exactly: SKIP\n\n"
+    "AUTHOR VOICE (imitate this person's writing, from their real posts):\n"
+    "It's interesting how @federalreserve meetings become so significant during a bull market or a heated market...\n"
+    "\n"
+    "We had a meeting today, yet there wasn't even a ripple of movement regarding that.\n"
+    "\n"
+    "I absolutely love BTC, but this level of speculation still worries me\n"
+    "-> Traits to mirror: curious and observational, honest ('I absolutely love BTC, but...'), a touch of "
+    "worry/caution, plain words, concise. Write like a thoughtful trader talking to a friend, not a news anchor.\n\n"
     "EXAMPLE of the right tone (facts first):\n"
     "Almost every on-chain tracker logged the same thing an hour ago...\n"
     "\n"
@@ -717,38 +744,51 @@ SYSTEM_PROMPT = (
 )
 
 
+_MID_VARIANTS = [
+    "That kind of move is worth a closer look.",
+    "This is the kind of thing that moves a market before the headlines do.",
+    "Numbers like this are why I watch the flow and not the noise.",
+    "The data is the real story here, more than the narrative.",
+    "A move this size gets my attention before I trust any take.",
+]
+_TAIL_VARIANTS = [
+    "I'd rather follow the flow than the hype for {name}",
+    "I watch moves like this before I ever buy the story for {name}",
+    "For {name}, I trust the numbers over the chatter",
+    "I'll be watching whether {name} can hold this",
+]
+
+
+def _human_name(topic: Topic) -> str:
+    if topic.trend_rank is None and topic.coin in THEME_LABELS:
+        return {
+            "VC Funding": "capital flows",
+            "Stablecoins & RWA": "the stablecoin economy",
+            "Regulação & Institucional": "the institutional shift",
+        }.get(topic.coin, "the space")
+    return topic.coin
+
+
 def template_post(topic: Topic) -> str:
-    """Fallback sem IA: usa um FATO real do topico (evita textao generico)."""
+    """Fallback sem IA: usa FATO real do topico, com frases variadas (sem repetir entre posts)."""
     best = None
     bm = -1.0
     for it in topic.items:
         mag = flow_magnitude_usdm(it.title)
         if mag > bm:
             best, bm = it, mag
+    name = _human_name(topic)
+    h = 0
+    for ch in topic.coin:
+        h = (h * 31 + ord(ch)) % 100000
+    mid = _MID_VARIANTS[h % len(_MID_VARIANTS)]
+    tail = _TAIL_VARIANTS[(h // 7) % len(_TAIL_VARIANTS)].format(name=name)
     if best is not None and bm > 0:
-        return (
-            f"{best.title.rstrip().rstrip('.')}...\n"
-            f"\n"
-            f"That kind of move is worth more than a hundred takes today.\n"
-            f"\n"
-            f"I'd rather follow the flow than the hype for {topic.coin}"
-        )
+        return f"{best.title.rstrip().rstrip('.')}...\n\n{mid}\n\n{tail}"
     item = topic.items[0] if topic.items else None
     if item:
-        return (
-            f"{item.title.rstrip().rstrip('.')}...\n"
-            f"\n"
-            f"Caught my attention around {topic.coin}.\n"
-            f"\n"
-            f"Nice narrative, but I trust the numbers over the story"
-        )
-    return (
-        f"{topic.coin} just made a move worth noticing...\n"
-        f"\n"
-        f"Checking the data before saying anything clever.\n"
-        f"\n"
-        f"I'll wait for confirmation"
-    )
+        return f"{item.title.rstrip().rstrip('.')}...\n\nCaught my attention around {name}.\n\n{tail}"
+    return f"{name} just made a move worth noticing...\n\nChecking the data before I say anything clever.\n\nI'll wait for confirmation"
 
 
 def generate_posts(topics: list[Topic], env: dict[str, str], limit: int = 2) -> list[tuple[Topic, str]]:
