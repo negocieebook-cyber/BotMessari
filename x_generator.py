@@ -236,26 +236,46 @@ def parse_rss_feed(url: str, source: str, kind: str, limit: int = 15) -> list[Ne
 
 
 def parse_youtube_feed(channel_id: str, channel_name: str, limit: int = 8) -> list[NewsItem]:
-    url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-    result = http_request("GET", url, timeout=30, headers={"Accept": "application/atom+xml,*/*"})
-    if not result.ok or not isinstance(result.data, str):
-        return []
-    try:
-        root = ET.fromstring(result.data)
-    except ET.ParseError:
-        return []
-    items: list[NewsItem] = []
-    for entry in root.iter():
-        if not entry.tag.endswith("entry"):
+    browser_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
+    attempts: list[tuple[str, str]] = [
+        ("oficial", f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"),
+        ("rsshub", f"{RSSHUB_BASE}/youtube/channel/{channel_id}"),
+    ]
+    last_err: str | None = None
+    for label, url in attempts:
+        result = http_request("GET", url, timeout=30, headers={"Accept": "application/atom+xml,*/*", "User-Agent": browser_ua})
+        if not result.ok:
+            last_err = f"{label}: status {result.status}"
             continue
-        title = clean_text(next((c.text or "" for c in entry if c.tag.endswith("title")), ""))
-        vid = next((c.text or "" for c in entry if c.tag.endswith("videoId")), "")
-        pub = next((c.text or "" for c in entry if c.tag.endswith("published")), "")
-        url = f"https://www.youtube.com/watch?v={vid}" if vid else ""
-        items.append(NewsItem(channel_name, title, url, pub, "youtube"))
-        if len(items) >= limit:
-            break
-    return items
+        raw = result.data
+        if not isinstance(raw, str) or raw.lstrip().startswith(("<html", "<!DOCTYPE")):
+            last_err = f"{label}: resposta nao-RSS (bloqueado/renderizado)"
+            continue
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            last_err = f"{label}: parse falhou"
+            continue
+        items: list[NewsItem] = []
+        for entry in root.iter():
+            if not entry.tag.endswith("entry"):
+                continue
+            title = clean_text(next((c.text or "" for c in entry if c.tag.endswith("title")), ""))
+            vid = next((c.text or "" for c in entry if c.tag.endswith("videoId")), "")
+            pub = next((c.text or "" for c in entry if c.tag.endswith("published")), "")
+            url = f"https://www.youtube.com/watch?v={vid}" if vid else ""
+            items.append(NewsItem(channel_name, title, url, pub, "youtube"))
+            if len(items) >= limit:
+                break
+        if items:
+            return items
+        last_err = f"{label}: feed vazio"
+    if last_err:
+        print(f"  [yt:{channel_name}] sem videos ({last_err})", file=sys.stderr)
+    return []
 
 
 def parse_twitter_feed(handle: str, limit: int = 8) -> list[NewsItem]:
