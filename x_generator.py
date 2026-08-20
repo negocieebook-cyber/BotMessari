@@ -694,34 +694,60 @@ def llm_chat(env: dict[str, str], system: str, user: str) -> str | None:
 
 
 SYSTEM_PROMPT = (
-    "You write short X posts in ENGLISH for the crypto-focused account @bpweb33 "
-    "(global audience). Replicate the author's exact preferred format:\n"
-    "EXAMPLE POST:\n"
-    "It\u2019s interesting how @federalreserve meetings become so significant during a bull market or a heated market...\n"
+    "You write short, human, native-English X posts for a crypto account (@bpweb33), global audience.\n\n"
+    "CONTENT RULES (most important):\n"
+    "- LEAD WITH A REAL, SPECIFIC FACT from the context: a price, a USD amount, a whale/flows move, "
+    "a funding round, a protocol launch, a number. Be concrete.\n"
+    "- NEVER write meta-filler such as 'X is all over the feed today', 'it shows up in N sources', "
+    "'this never happens by chance', 'worth asking what everyone is missing', 'I like the coin'.\n"
+    "- Sound like a person who noticed ONE concrete thing and shares it with a light, genuine opinion.\n"
+    "- Use only facts that appear in the context. If there's no solid fact, reply exactly: SKIP\n\n"
+    "EXAMPLE of the right tone (facts first):\n"
+    "Almost every on-chain tracker logged the same thing an hour ago...\n"
     "\n"
-    "We had a meeting today, yet there wasn\u2019t even a ripple of movement regarding that.\n"
+    "A whale that was dormant for 600 days just moved $52M in PEPE to a new address.\n"
     "\n"
-    "I absolutely love BTC, but this level of speculation still worries me\n\n"
-    "FORMAT RULES (follow precisely):\n"
-    "- English, conversational and observational, personal voice.\n"
+    "I'll be watching whether it hits an exchange\n\n"
+    "FORMAT (follow precisely, the author's style):\n"
     "- Exactly 3 short paragraphs, each separated by a BLANK line.\n"
-    "- Paragraph 1: a hook / open-ended thought ENDING WITH '...'\n"
-    "- Paragraph 2: the concrete fact or development ENDING WITH '.'\n"
-    "- Paragraph 3: a personal take / closing thought ENDING WITH NO punctuation.\n"
-    "- Max ~270 characters total (free X plan). No emojis, no hashtags, no ALL-CAPS.\n"
-    "- Never invent figures: use ONLY real facts/numbers from the context; cite them naturally.\n"
-    "- If there is no solid fact to turn into a post, reply exactly: SKIP"
+    "- Para 1: a hook / open-ended observation ENDING WITH '...'\n"
+    "- Para 2: the concrete fact in one clean line ENDING WITH '.'\n"
+    "- Para 3: a short personal take ENDING WITH NO punctuation.\n"
+    "- Max ~270 characters (free X plan). No emojis, no hashtags, no ALL-CAPS."
 )
 
 
 def template_post(topic: Topic) -> str:
-    srcs = ", ".join(sorted({it.source for it in topic.items})[:2])
+    """Fallback sem IA: usa um FATO real do topico (evita textao generico)."""
+    best = None
+    bm = -1.0
+    for it in topic.items:
+        mag = flow_magnitude_usdm(it.title)
+        if mag > bm:
+            best, bm = it, mag
+    if best is not None and bm > 0:
+        return (
+            f"{best.title.rstrip().rstrip('.')}...\n"
+            f"\n"
+            f"That kind of move is worth more than a hundred takes today.\n"
+            f"\n"
+            f"I'd rather follow the flow than the hype for {topic.coin}"
+        )
+    item = topic.items[0] if topic.items else None
+    if item:
+        return (
+            f"{item.title.rstrip().rstrip('.')}...\n"
+            f"\n"
+            f"Caught my attention around {topic.coin}.\n"
+            f"\n"
+            f"Nice narrative, but I trust the numbers over the story"
+        )
     return (
-        f"{topic.coin} is all over the feed today, and it\u2019s worth asking what everyone is missing...\n"
+        f"{topic.coin} just made a move worth noticing...\n"
         f"\n"
-        f"It shows up in {topic.total_score} independent sources right now, from {srcs}, which almost never happens by chance.\n"
+        f"Checking the data before saying anything clever.\n"
         f"\n"
-        f"I like the coin, but watching this kind of heat still makes me pause"
+        f"I'll wait for confirmation"
     )
 
 
