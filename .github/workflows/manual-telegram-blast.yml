@@ -1,0 +1,31 @@
+name: Manual Telegram Blast
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: 'Mensagem a enviar'
+        required: true
+        type: string
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send to Telegram
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEXT: ${{ inputs.text }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.request, urllib.parse
+          data = urllib.parse.urlencode({
+              'chat_id': os.environ['CHAT'],
+              'text': os.environ['TEXT'],
+              'disable_web_page_preview': 'true',
+          }).encode()
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{os.environ['TOKEN']}/sendMessage", data=data)
+          resp = urllib.request.urlopen(req, timeout=30).read().decode()
+          print(resp[:300])
+          assert '"ok":true' in resp, 'FALHOU'
+          PY
