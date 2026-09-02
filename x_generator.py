@@ -738,9 +738,11 @@ SYSTEM_PROMPT = (
     "- Anchor the post in ONE real, specific fact from the context (a price, a USD amount, a "
     "whale/flows move, a funding round, a protocol launch, a number). Be concrete and exact.\n"
     "- NEVER invent figures. Use only what is in the context. No number in the context -> no "
-    "number in the post.\n"
-    "- Write like a person who noticed one thing and shares it briefly, not a news anchor and not "
-    "a marketer.\n"
+        "number in the post.\n"
+        "- Never mention internal scoring, source counts, 'confluence', or the number of feeds that "
+        "mentioned something -- write as a person sharing a thought, never as a list or a report.\n"
+        "- Write like a person who noticed one thing and shares it briefly, not a news anchor and not "
+        "a marketer.\n"
     "- BANNED filler (never write these or their siblings): 'all over the feed today', 'worth a "
     "closer look', \"I'll be watching\", 'trust the numbers over the chatter', 'this never happens "
     "by chance', 'what everyone is missing', 'only time will tell', 'worth asking'.\n\n"
@@ -761,8 +763,10 @@ SYSTEM_PROMPT = (
     "FORMAT (loose, not a rigid template):\n"
     "- ~270 characters total (free X plan).\n"
     "- Up to 3 short paragraphs separated by BLANK lines.\n"
-    "- Vary where the fact lands (fact first, or thought first and the fact second) -- your call.\n"
-    "- English only. No emojis, no hashtags, no ALL-CAPS."
+        "- Vary where the fact lands (fact first, or thought first and the fact second) -- your call.\n"
+        "- Every paragraph is a complete thought; do NOT end a paragraph mid-sentence on a dangling "
+        "\"...\". End cleanly even when the thought is open-ended.\n"
+        "- English only. No emojis, no hashtags, no ALL-CAPS.\n"
 )
 
 
@@ -793,12 +797,40 @@ FILLER_PATTERNS = [
     r"worth asking",
     r"caught my attention",
     r"worth noticing",
+    r"worth noting",
+    # vazamento de metadados internos (score/confluencia/fontes) que nunca podem ir no post
+    r"\d+\s*pts?\b",
+    r"\d+\s*sources?\b",
+    r"independent sources",
+    r"confluenc",
+    r"\bfontes\b",
+    r"fontes independentes",
+    # resto de marcador/junk que o modelo as vezes cospe
+    r"\[/?\w+\]",
+    r"\b##\b",
+    r"\bpost\s*\d\b",
+    r"fontes/fatos",
 ]
 
 
 def has_filler(text: str) -> bool:
     low = (text or "").lower()
     return any(re.search(p, low) for p in FILLER_PATTERNS)
+
+
+def _dangling_end(text: str) -> bool:
+    """Post terminando em reticencia no vacuo ('If...', 'keeping an...') = frase cortada."""
+    t = (text or "").rstrip()
+    return t.endswith("…") or t.endswith("...")
+
+
+def _strip_dangling_ellipsis(text: str) -> str:
+    t = text.rstrip()
+    for sep in ("…", "..."):
+        if t.endswith(sep):
+            t = t[: -len(sep)].rstrip()
+            break
+    return t
 
 
 def _human_name(topic: Topic) -> str:
@@ -881,15 +913,19 @@ def pick_topics_via_llm(env: dict[str, str], topics: list[Topic], want: int = 2,
     return nums[:want]
 
 
-def truncate_post(text: str, hard: int = 300) -> str:
-    """Corta em limite de palavra, sem estragar o fim do post."""
-    if len(text) <= hard:
-        return text
-    cut = text[: hard - 1]
-    sp = cut.rfind(" ")
-    if sp > 0:
-        cut = cut[:sp]
-    return cut.rstrip() + "…"
+def truncate_post(text: str, hard: int = 297) -> str:
+    """Ultimo recurso p/ post longo: corta no fim de uma frase COMPLETA (ponto),
+    sem injetar reticencia pendurada nem cortar palavra no meio."""
+    t = text.rstrip()
+    if len(t) <= hard:
+        return t
+    window = t[:hard]
+    for sep in (". ", ".\n", "? ", "! "):
+        cut = window.rfind(sep)
+        if cut >= int(hard * 0.5):
+            return t[: cut + 1].rstrip()
+    sp = window.rfind(" ")
+    return (window[:sp] if sp > 0 else window).rstrip()
 
 
 def generate_posts(topics: list[Topic], env: dict[str, str], limit: int = 2) -> list[tuple[Topic, str]]:
@@ -918,20 +954,30 @@ def generate_posts(topics: list[Topic], env: dict[str, str], limit: int = 2) -> 
             continue
         text = text.strip().strip('"').strip()
 
-        if has_filler(text):
-            # gate de qualidade: 1 re-geracao sem as frases-coringa
+        if (
+            has_filler(text)
+            or _dangling_end(text)
+            or len(text) > 285
+        ):
+            # gate de qualidade: 1 re-geracao sem frase-coringa, sem final cortado,
+            # e respeitando o limite de ~270-285 chars (evita truncamento via corte)
             retry = llm_chat(
                 env,
                 SYSTEM_PROMPT,
                 "Contexto (so dados reais):\n" + ctx
-                + "\n\nYour previous draft leaned on empty filler phrases. Rewrite the SAME idea with "
-                  "specific, concrete language -- real numbers, real action, no meta-commentary. "
-                  "Post text only. If you still cannot, reply exactly: SKIP",
+                + "\n\nYour previous draft was too long (over ~285 characters), used empty filler "
+                  "phrases, and/or ended mid-thought on a dangling '...'. Rewrite the SAME idea tighter: "
+                  "UNDER 270 characters, specific concrete language, real numbers, no meta-commentary, "
+                  "every paragraph a complete thought with a clean ending. Post text only. If you still "
+                  "cannot, reply exactly: SKIP",
             )
             if retry and retry.strip().upper() != "SKIP":
                 text = retry.strip().strip('"').strip()
 
+        # rede de seguranca final: nada de reticencia pendurada, e corte sem dano (sem "...")
+        text = _strip_dangling_ellipsis(text)
         text = truncate_post(text)
+        text = _strip_dangling_ellipsis(text)
         posts.append((topic, text))
     return posts
 
@@ -1033,7 +1079,7 @@ def main() -> int:
     for i, (topic, text) in enumerate(posts, 1):
         md_lines.append(f"## POST {i} — {topic.coin}\n")
         md_lines.append(text + "\n")
-        md_lines.append(f"**Ângulo (por que este post):** {topic.coin} — {topic.total_score}pts em {len(topic.scores)} fontes independentes.")
+        md_lines.append(f"**Ângulo (por que este post):** {topic.coin} — {topic.total_score}pts em {len(topic.scores)} fonte{'s' if len(topic.scores) != 1 else ''} independente{'s' if len(topic.scores) != 1 else ''}.")
         md_lines.append("**Fontes/fatos:**")
         for it in topic.items[:4]:
             md_lines.append(f"- [{it.source}] {it.title} — {it.url}")
