@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-x_generator.py  —  Gerador de posts prontos para o X (em PT-BR).
+x_generator.py  —  Gerador de posts prontos para o X (inglês, voz autoral, com discernimento editorial).
 
 Cria 1-2 posts virais a partir do CRUZAMENTO de múltiplas fontes:
   - Noticias cripto (RSS gringo: Cointelegraph, The Defiant, CryptoSlate, CryptoPotato)
@@ -730,50 +730,75 @@ def llm_chat(env: dict[str, str], system: str, user: str) -> str | None:
 
 
 SYSTEM_PROMPT = (
-    "You write short, human, native-English X posts for a crypto account (@bpweb33), global audience.\n\n"
-    "CONTENT RULES (most important):\n"
-    "- LEAD WITH A REAL, SPECIFIC FACT from the context: a price, a USD amount, a whale/flows move, "
-    "a funding round, a protocol launch, a number. Be concrete.\n"
-    "- NEVER write meta-filler such as 'X is all over the feed today', 'it shows up in N sources', "
-    "'this never happens by chance', 'worth asking what everyone is missing', 'I like the coin'.\n"
-    "- Sound like a person who noticed ONE concrete thing and shares it with a light, genuine opinion.\n"
-    "- Use only facts that appear in the context. If there's no solid fact, reply exactly: SKIP\n\n"
-    "AUTHOR VOICE (imitate this person's writing, from their real posts):\n"
+    "You are the editor and writer for a crypto X account (@bpweb33), global audience, "
+    "native English. Your job is discernment: from the facts supplied, find the angle that is "
+    "genuinely worth a post and write it in a human voice. You are NOT a news router and do NOT "
+    "just repeat the most-mentioned topic.\n\n"
+    "CONTENT RULES:\n"
+    "- Anchor the post in ONE real, specific fact from the context (a price, a USD amount, a "
+    "whale/flows move, a funding round, a protocol launch, a number). Be concrete and exact.\n"
+    "- NEVER invent figures. Use only what is in the context. No number in the context -> no "
+    "number in the post.\n"
+    "- Write like a person who noticed one thing and shares it briefly, not a news anchor and not "
+    "a marketer.\n"
+    "- BANNED filler (never write these or their siblings): 'all over the feed today', 'worth a "
+    "closer look', \"I'll be watching\", 'trust the numbers over the chatter', 'this never happens "
+    "by chance', 'what everyone is missing', 'only time will tell', 'worth asking'.\n\n"
+    "VOICE to mirror (from the author's real posts):\n"
     "It's interesting how @federalreserve meetings become so significant during a bull market or a heated market...\n"
     "\n"
     "We had a meeting today, yet there wasn't even a ripple of movement regarding that.\n"
     "\n"
     "I absolutely love BTC, but this level of speculation still worries me\n"
-    "-> Traits to mirror: curious and observational, honest ('I absolutely love BTC, but...'), a touch of "
-    "worry/caution, plain words, concise. Write like a thoughtful trader talking to a friend, not a news anchor.\n\n"
-    "EXAMPLE of the right tone (facts first):\n"
+    "Traits to mirror: observant, honest (name the worry/caution), a touch of skepticism, plain "
+    "words, concise.\n\n"
+    "EXAMPLE of the right tone (specific fact, a little dry):\n"
     "Almost every on-chain tracker logged the same thing an hour ago...\n"
     "\n"
     "A whale that was dormant for 600 days just moved $52M in PEPE to a new address.\n"
     "\n"
-    "I'll be watching whether it hits an exchange\n\n"
-    "FORMAT (follow precisely, the author's style):\n"
-    "- Exactly 3 short paragraphs, each separated by a BLANK line.\n"
-    "- Para 1: a hook / open-ended observation ENDING WITH '...'\n"
-    "- Para 2: the concrete fact in one clean line ENDING WITH '.'\n"
-    "- Para 3: a short personal take ENDING WITH NO punctuation.\n"
-    "- Max ~270 characters (free X plan). No emojis, no hashtags, no ALL-CAPS."
+    "Whether that lands on an exchange is the part I'll keep checking.\n\n"
+    "FORMAT (loose, not a rigid template):\n"
+    "- ~270 characters total (free X plan).\n"
+    "- Up to 3 short paragraphs separated by BLANK lines.\n"
+    "- Vary where the fact lands (fact first, or thought first and the fact second) -- your call.\n"
+    "- English only. No emojis, no hashtags, no ALL-CAPS."
 )
 
 
 _MID_VARIANTS = [
-    "That kind of move is worth a closer look.",
-    "This is the kind of thing that moves a market before the headlines do.",
-    "Numbers like this are why I watch the flow and not the noise.",
-    "The data is the real story here, more than the narrative.",
+    "Moves that size usually carry a reason before the headline does.",
+    "That scale of flow is the part markets price before most people look.",
+    "This is where real money tends to show up before the narrative does.",
+    "Discrepancies this big are rarely noise.",
     "A move this size gets my attention before I trust any take.",
 ]
 _TAIL_VARIANTS = [
     "I'd rather follow the flow than the hype for {name}",
     "I watch moves like this before I ever buy the story for {name}",
-    "For {name}, I trust the numbers over the chatter",
-    "I'll be watching whether {name} can hold this",
+    "How {name} holds from here will tell you more than any take",
+    "Whether {name} can hold that level is the question now",
 ]
+
+# Frases-coringa que matam a voz humana. Usadas para (a) proibir o modelo de repetir
+# e (b) gate de qualidade pós-geração com 1 re-geração.
+FILLER_PATTERNS = [
+    r"all over the feed",
+    r"worth a closer look",
+    r"i'?ll be watching",
+    r"trust the numbers over",
+    r"never happens by chance",
+    r"everyone is missing",
+    r"only time will tell",
+    r"worth asking",
+    r"caught my attention",
+    r"worth noticing",
+]
+
+
+def has_filler(text: str) -> bool:
+    low = (text or "").lower()
+    return any(re.search(p, low) for p in FILLER_PATTERNS)
 
 
 def _human_name(topic: Topic) -> str:
@@ -808,26 +833,106 @@ def template_post(topic: Topic) -> str:
     return f"{name} just made a move worth noticing...\n\nChecking the data before I say anything clever.\n\nI'll wait for confirmation"
 
 
+def _best_fact_line(topic: Topic) -> str:
+    """Primeira headline concreta do topico, p/ o menu do editor."""
+    for it in topic.items[:6]:
+        if it.title.strip():
+            return it.title.strip()[:160]
+    return "no concrete headline captured"
+
+
+def pick_topics_via_llm(env: dict[str, str], topics: list[Topic], want: int = 2, k: int = 6) -> list[int]:
+    """
+    Camada de DISCERNIMENTO: em vez de postar so o mais-citado (score de confluencia),
+    deixa o LLM escolher QUAIS historias valem post, por substancia e interesse.
+    Se nao houver chave de LLM ou vier resposta invalida, retorna [] (fallback = ordem de score).
+    """
+    if not (env.get("OPENROUTER_API_KEY") or env.get("MESSARI_API_KEY")):
+        return []
+    if not topics:
+        return []
+    k = max(1, min(k, len(topics)))
+    want = max(1, want)
+    menu = []
+    for i, t in enumerate(topics[:k], 1):
+        menu.append(f"{i}. {t.coin} ({t.total_score}pts, {len(t.scores)} fontes) -- {_best_fact_line(t)}")
+    editor_system = (
+        "You are the editor for a crypto X account. Below is a ranked list of candidate stories "
+        "from today's independent feeds (news, on-chain whale/flows, YouTube). The rank reflects "
+        "how often each coin was mentioned -- IGNORE rank as a quality signal. Pick the candidates "
+        "that are GENUINELY worth a post: specific, concrete, surprising, with a real fact behind "
+        "them. Thin or generic candidates are not publishable just because they were mentioned a lot.\n\n"
+        f"CANDIDATES:\n{chr(10).join(menu)}\n\n"
+        f"Reply with ONLY the numbers you want, comma-separated, most interesting first (e.g. '3, 5'). "
+        "Pick no more than " + str(want) + ". If fewer than one candidate is solid and specific, reply exactly: SKIP"
+    )
+    resp = llm_chat(env, editor_system, "Choose which candidates deserve a post.")
+    if not resp:
+        return []
+    if resp.strip().upper() == "SKIP":
+        return []
+    nums: list[int] = []
+    for tok in re.split(r"[,\s;/]+", resp):
+        tok = tok.strip()
+        if tok.isdigit() and 1 <= int(tok) <= k:
+            cand = int(tok) - 1
+            if cand not in nums:
+                nums.append(cand)
+    return nums[:want]
+
+
+def truncate_post(text: str, hard: int = 300) -> str:
+    """Corta em limite de palavra, sem estragar o fim do post."""
+    if len(text) <= hard:
+        return text
+    cut = text[: hard - 1]
+    sp = cut.rfind(" ")
+    if sp > 0:
+        cut = cut[:sp]
+    return cut.rstrip() + "…"
+
+
 def generate_posts(topics: list[Topic], env: dict[str, str], limit: int = 2) -> list[tuple[Topic, str]]:
     posts: list[tuple[Topic, str]] = []
-    for topic in topics[:limit * 3]:  # tenta um pouquinho alem, por causa de SKIPs
+
+    # Escolha editorial (discernimento): LLM elege os temas por interesse/substancia.
+    order = pick_topics_via_llm(env, topics, want=limit, k=min(6, len(topics)))
+    if not order:
+        # sem chave/LLM indisponivel -> ordem de confluencia (fallback original)
+        order = list(range(min(len(topics), limit * 3)))
+
+    for idx in order:
+        if idx >= len(topics) or len(posts) >= limit:
+            continue
+        topic = topics[idx]
         ctx = build_context(topic, {})
         text = llm_chat(
             env,
             SYSTEM_PROMPT,
             "Contexto (so dados reais):\n" + ctx
-            + "\n\nEscreva 1 post pronto (apenas o texto do post, sem introducao, sem aspas, sem hashtags excessivas).",
+            + "\n\nWrite 1 finished post now. Output the post text only -- no intro, no quotes, no labels.",
         )
         if text is None:
             text = template_post(topic)
         elif text.strip().upper() == "SKIP":
             continue
         text = text.strip().strip('"').strip()
-        if len(text) > 300:
-            text = text[:297].rstrip() + "…"
+
+        if has_filler(text):
+            # gate de qualidade: 1 re-geracao sem as frases-coringa
+            retry = llm_chat(
+                env,
+                SYSTEM_PROMPT,
+                "Contexto (so dados reais):\n" + ctx
+                + "\n\nYour previous draft leaned on empty filler phrases. Rewrite the SAME idea with "
+                  "specific, concrete language -- real numbers, real action, no meta-commentary. "
+                  "Post text only. If you still cannot, reply exactly: SKIP",
+            )
+            if retry and retry.strip().upper() != "SKIP":
+                text = retry.strip().strip('"').strip()
+
+        text = truncate_post(text)
         posts.append((topic, text))
-        if len(posts) >= limit:
-            break
     return posts
 
 
@@ -855,7 +960,7 @@ def send_telegram_blocks(env: dict[str, str], blocks: list[str]) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Gera posts prontos para o X (PT-BR) cruzando fontes.")
+    parser = argparse.ArgumentParser(description="Gera posts prontos para o X (inglês, voz autoral) cruzando fontes.")
     parser.add_argument("--send-telegram", action="store_true", help="Envia cada post como mensagem separada no Telegram.")
     parser.add_argument("--dry-run", action="store_true", help="Nao grava state nem envia Telegram.")
     parser.add_argument("--limit", type=int, default=2, help="Quantos posts gerar (padrao 2).")
@@ -928,6 +1033,7 @@ def main() -> int:
     for i, (topic, text) in enumerate(posts, 1):
         md_lines.append(f"## POST {i} — {topic.coin}\n")
         md_lines.append(text + "\n")
+        md_lines.append(f"**Ângulo (por que este post):** {topic.coin} — {topic.total_score}pts em {len(topic.scores)} fontes independentes.")
         md_lines.append("**Fontes/fatos:**")
         for it in topic.items[:4]:
             md_lines.append(f"- [{it.source}] {it.title} — {it.url}")
