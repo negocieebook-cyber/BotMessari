@@ -1016,6 +1016,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+
+# ----------------------------------------------------------------------------
+# Deduplicacao por historia (evita repostar o mesmo fato/coin dias a fio)
+# ----------------------------------------------------------------------------
+
+def _story_fingerprint(item: NewsItem) -> str:
+    base = re.sub(r"[^a-z0-9]+", "", (item.title or "").lower()).strip()
+    return f"{item.source}|{base}" if base else ""
+
+
+def _within_hours(ts: str, now: datetime, hours: int) -> bool:
+    try:
+        t = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return False
+    return (now - t) < timedelta(hours=hours)
+
+
+def _recent_stories(state: StateManager, hours: int = 36) -> set[str]:
+    now = datetime.now(timezone.utc)
+    recent = state.state.get("posted_fps", {})
+    return {fp for fp, ts in recent.items() if _within_hours(ts, now, hours)}
+
+
+def _prune_stories(state: StateManager, hours: int = 48) -> None:
+    now = datetime.now(timezone.utc)
+    recent = state.state.get("posted_fps", {})
+    state.state["posted_fps"] = {fp: ts for fp, ts in recent.items() if _within_hours(ts, now, hours)}
+
+
 def main() -> int:
     load_env_file(Path(".env"))
     print("  [env] MESSARI_API_KEY:", env_status("MESSARI_API_KEY"))
@@ -1065,6 +1095,14 @@ def main() -> int:
         rank = f" | trending #{t.trend_rank}" if t.trend_rank else ""
         print(f"  {t.total_score} pts {t.coin}{rank}: {', '.join(f'{k} {v}x' for k, v in sorted(t.scores.items(), key=lambda kv: -kv[1]))}")
 
+    # Nao repostar historias ja entregues nas ultimas ~36h: o editor passa a
+    # escolher algo fresco em vez de repetir o mesmo fato/coin em toda rodada.
+    recent = _recent_stories(state)
+    if recent:
+        fresh = [t for t in topics if not any(_story_fingerprint(it) in recent for it in t.items[:4])]
+        if fresh:
+            topics = fresh
+
     posts = generate_posts(topics, env, args.limit)
 
     out_dir = Path(args.output_dir)
@@ -1086,6 +1124,15 @@ def main() -> int:
         md_lines.append("")
         blocks.append(text)
         payload_saved.append({"coin": topic.coin, "post": text, "sources": [it.url for it in topic.items[:4]]})
+
+    # registra o que foi postado para nao repetir nas proximas rodadas
+    for (_topic, _text) in posts:
+        state.state.setdefault("posted_fps", {})
+        for it in _topic.items[:2]:
+            fp = _story_fingerprint(it)
+            if fp:
+                state.state["posted_fps"][fp] = datetime.now(timezone.utc).isoformat()
+    _prune_stories(state)
 
     md_path.write_text("\n".join(md_lines), encoding="utf-8")
     json_path.write_text(json.dumps(payload_saved, ensure_ascii=False, indent=2), encoding="utf-8")
