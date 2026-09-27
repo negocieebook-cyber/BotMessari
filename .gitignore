@@ -1,5 +1,8 @@
 .env
 reports/
 state/
+logs/
+x_posts/
 __pycache__/
 *.pyc
+.pytest_cache/

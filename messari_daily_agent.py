@@ -10,25 +10,34 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
-from html import unescape
-from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import unescape
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin
+
+from lib.common import (
+    ApiResult,
+    MessariClient,
+    TelegramClient,
+    clean_html_text,
+    clean_markdown_flat,
+    fetch_public_url,
+    load_env_file,
+    money,
+    pct,
+    require_env,
+    single_instance_lock,
+    split_for_telegram,
+    unique_keep_order,
+    unwrap_data as unwrap_payload,
+)
 
 
-API_BASE = "https://api.messari.io"
 DEFAULT_ASSETS = ["bitcoin", "ethereum", "solana", "hyperliquid"]
-TELEGRAM_BASE = "https://api.telegram.org"
-TELEGRAM_LIMIT = 3900
-PLACEHOLDER_MARKERS = ("sua-chave", "token-do", "seu-chat", "aqui")
 PUBLIC_RESEARCH_URLS = [
     "https://messari.io/research/research-reports?page=1",
     "https://messari.io/research/valuations",
@@ -38,108 +47,8 @@ PUBLIC_NEWSLETTER_PODCAST_URL = "https://messari.io/research/newsletter-and-podc
 MESSARI_PODCAST_RSS_URL = "https://anchor.fm/s/fb66e238/podcast/rss"
 
 
-@dataclass
-class ApiResult:
-    ok: bool
-    status: int | None
-    data: Any = None
-    error: str | None = None
-
-
-class MessariClient:
-    def __init__(self, api_key: str, timeout: int = 45) -> None:
-        self.api_key = api_key
-        self.timeout = timeout
-
-    def get(self, path: str, params: dict[str, Any] | None = None) -> ApiResult:
-        query = f"?{urlencode(params, doseq=True)}" if params else ""
-        return self._request("GET", f"{API_BASE}{path}{query}")
-
-    def post(self, path: str, payload: dict[str, Any]) -> ApiResult:
-        return self._request("POST", f"{API_BASE}{path}", payload)
-
-    def _request(self, method: str, url: str, payload: dict[str, Any] | None = None) -> ApiResult:
-        body = json.dumps(payload).encode("utf-8") if payload is not None else None
-        headers = {
-            "X-Messari-API-Key": self.api_key,
-            "Accept": "application/json",
-            "User-Agent": "BotMessariDailyAgent/1.0",
-        }
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-
-        request = Request(url, data=body, headers=headers, method=method)
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8")
-                return ApiResult(True, response.status, _json_or_text(raw))
-        except HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            parsed = _json_or_text(raw)
-            message = parsed.get("error") if isinstance(parsed, dict) else raw
-            return ApiResult(False, exc.code, parsed, str(message or exc.reason))
-        except URLError as exc:
-            return ApiResult(False, None, None, str(exc.reason))
-        except TimeoutError:
-            return ApiResult(False, None, None, "Request timed out")
-
-
-class TelegramClient:
-    def __init__(self, bot_token: str, chat_id: str, timeout: int = 45) -> None:
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.timeout = timeout
-
-    def send_text(self, text: str) -> ApiResult:
-        chunks = split_for_telegram(text)
-        last_result = ApiResult(True, 200, {})
-        for chunk in chunks:
-            last_result = self._post("sendMessage", {"chat_id": self.chat_id, "text": chunk})
-            if not last_result.ok:
-                return last_result
-        return last_result
-
-    def _post(self, method: str, payload: dict[str, Any]) -> ApiResult:
-        url = f"{TELEGRAM_BASE}/bot{self.bot_token}/{method}"
-        body = json.dumps(payload).encode("utf-8")
-        request = Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8")
-                return ApiResult(True, response.status, _json_or_text(raw))
-        except HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            parsed = _json_or_text(raw)
-            message = parsed.get("description") if isinstance(parsed, dict) else raw
-            return ApiResult(False, exc.code, parsed, str(message or exc.reason))
-        except URLError as exc:
-            return ApiResult(False, None, None, str(exc.reason))
-        except TimeoutError:
-            return ApiResult(False, None, None, "Request timed out")
-
-
-def _json_or_text(raw: str) -> Any:
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-
-
-def unique_keep_order(items: list[str]) -> list[str]:
-    seen = set()
-    unique = []
-    for item in items:
-        key = item.strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        unique.append(item.strip())
-    return unique
+def clean_markdown(text: str, max_chars: int = 900) -> str:
+    return clean_markdown_flat(text, max_chars)
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -218,70 +127,10 @@ def remember_public_items(state: dict[str, Any], item_ids: list[str]) -> None:
     state["last_sent_at"] = datetime.now(timezone.utc).isoformat()
 
 
-def split_for_telegram(text: str) -> list[str]:
-    normalized = text.replace("\r\n", "\n")
-    if len(normalized) <= TELEGRAM_LIMIT:
-        return [normalized]
-
-    chunks = []
-    current = ""
-    for block in normalized.split("\n\n"):
-        candidate = f"{current}\n\n{block}".strip() if current else block
-        if len(candidate) <= TELEGRAM_LIMIT:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        while len(block) > TELEGRAM_LIMIT:
-            chunks.append(block[:TELEGRAM_LIMIT])
-            block = block[TELEGRAM_LIMIT:]
-        current = block
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def money(value: Any) -> str:
-    if not isinstance(value, (int, float)):
-        return "n/d"
-    if abs(value) >= 1_000_000_000:
-        return f"${value / 1_000_000_000:,.2f}B"
-    if abs(value) >= 1_000_000:
-        return f"${value / 1_000_000:,.2f}M"
-    if abs(value) >= 1:
-        return f"${value:,.2f}"
-    return f"${value:,.6f}"
-
-
-def pct(value: Any) -> str:
-    if not isinstance(value, (int, float)):
-        return "n/d"
-    sign = "+" if value > 0 else ""
-    return f"{sign}{value:.2f}%"
-
-
-def clean_markdown(text: str, max_chars: int = 900) -> str:
-    text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text or "")
-    text = re.sub(r"[*_`>#]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 3].rsplit(" ", 1)[0] + "..."
-
-
-def clean_html_text(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text or "")
-    text = unescape(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
 def unwrap_data(result: ApiResult) -> Any:
     if not result.ok:
         return None
-    if isinstance(result.data, dict) and "data" in result.data:
-        return result.data["data"]
-    return result.data
+    return unwrap_payload(result.data)
 
 
 def unavailable_line(name: str, result: ApiResult) -> str:
@@ -333,28 +182,6 @@ def fetch_research(client: MessariClient, limit: int, tags: list[str]) -> tuple[
             detailed.append(report)
             errors.append(unavailable_line(f"Research detail {report_id}", detail))
     return detailed, errors
-
-
-def fetch_public_url(url: str, timeout: int = 45) -> ApiResult:
-    request = Request(
-        url,
-        headers={
-            "Accept": "text/html,application/xhtml+xml",
-            "User-Agent": "BotMessariDailyAgent/1.0 public-research-check",
-        },
-        method="GET",
-    )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            return ApiResult(True, response.status, raw)
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        return ApiResult(False, exc.code, raw, str(exc.reason))
-    except URLError as exc:
-        return ApiResult(False, None, None, str(exc.reason))
-    except TimeoutError:
-        return ApiResult(False, None, None, "Request timed out")
 
 
 def child_text(element: ElementTree.Element, name: str) -> str:
@@ -797,17 +624,6 @@ def write_report(content: str, output_dir: Path) -> Path:
     return path
 
 
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a daily Messari crypto briefing.")
     parser.add_argument("--assets", default=",".join(DEFAULT_ASSETS), help="Comma-separated asset slugs or IDs.")
@@ -825,36 +641,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--send-telegram", action="store_true", help="Send the report to Telegram.")
     parser.add_argument("--dry-run", action="store_true", help="Do not write state or send Telegram.")
     return parser.parse_args()
-
-
-def looks_like_placeholder(value: str) -> bool:
-    lowered = value.lower()
-    return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
-
-
-def require_env(name: str) -> str | None:
-    value = os.getenv(name, "").strip()
-    if not value:
-        print(f"Missing {name}. Add it to .env.", file=sys.stderr)
-        return None
-    if looks_like_placeholder(value):
-        print(f"{name} still looks like a placeholder in .env.", file=sys.stderr)
-        return None
-    if name == "TELEGRAM_BOT_TOKEN":
-        if any(char.isspace() for char in value):
-            print("TELEGRAM_BOT_TOKEN contains spaces or line breaks. Remove all spaces from the token in .env.", file=sys.stderr)
-            return None
-        if ":" not in value:
-            print("TELEGRAM_BOT_TOKEN must look like 123456789:ABCDEF... and contain a colon.", file=sys.stderr)
-            return None
-        if value.lower().startswith("bot"):
-            print("TELEGRAM_BOT_TOKEN must not start with 'bot'. Paste only the token from BotFather.", file=sys.stderr)
-            return None
-    if name == "TELEGRAM_CHAT_ID":
-        if any(char.isspace() for char in value):
-            print("TELEGRAM_CHAT_ID contains spaces or line breaks. Remove all spaces from the chat id in .env.", file=sys.stderr)
-            return None
-    return value
 
 
 def main() -> int:
@@ -935,7 +721,6 @@ def main() -> int:
     path = write_report(report, Path(args.output_dir))
     print(f"Report written to {path}")
 
-    delivered = False
     if args.send_telegram:
         bot_token = require_env("TELEGRAM_BOT_TOKEN")
         chat_id = require_env("TELEGRAM_CHAT_ID")
@@ -944,17 +729,20 @@ def main() -> int:
         if args.dry_run:
             print("Dry run enabled; Telegram delivery skipped.")
         else:
+            # Registra ANTES do envio para nunca reenviar em caso de crash;
+            # se o envio falhar, desfaz o registro e permite nova tentativa.
+            pre_send_state = json.loads(json.dumps(state))
+            remember_research(state, new_research_ids, new_research_fingerprints)
+            remember_public_items(state, [*new_news_ids, *new_podcast_ids])
+            save_state(state_path, state)
             telegram = TelegramClient(bot_token, chat_id)
             sent = telegram.send_text(report)
             if not sent.ok:
                 print(f"Telegram delivery failed: {sent.error}", file=sys.stderr)
+                save_state(state_path, pre_send_state)
                 return 4
             print("Telegram message sent.")
-            delivered = True
-    else:
-        delivered = True
-
-    if delivered and not args.dry_run:
+    elif not args.dry_run:
         remember_research(state, new_research_ids, new_research_fingerprints)
         remember_public_items(state, [*new_news_ids, *new_podcast_ids])
         save_state(state_path, state)
@@ -962,4 +750,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        with single_instance_lock("messari_daily_agent"):
+            raise SystemExit(main())
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(5)

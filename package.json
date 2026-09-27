@@ -6,8 +6,11 @@
   "scripts": {
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\run_loop.ps1 -RunImmediately",
     "once": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\run_daily.ps1",
+    "once:messari": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"python .\\messari_daily_agent.py --send-telegram\"",
+    "x": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\run_x.ps1",
     "start": "npm run dev",
-    "test": "python -c \"import ast, pathlib; ast.parse(pathlib.Path('crypto_daily_agent.py').read_text(encoding='utf-8')); print('python syntax ok')\"",
+    "test": "python -m pytest tests -q",
+    "test:py": "python -c \"import ast, pathlib; [ast.parse(pathlib.Path(f).read_text(encoding='utf-8')) for f in ['crypto_daily_agent.py','messari_daily_agent.py','x_generator.py','lib/common.py']]; print('python syntax ok')\"",
     "schedule": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\install_windows_task.ps1"
   }
 }

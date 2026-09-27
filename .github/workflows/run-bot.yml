@@ -7,6 +7,14 @@ on:
     # Semanal aos domingos às 08:00 BRT (= 11:00 UTC)
     - cron: '0 11 * * 0'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Qual relatorio rodar'
+        type: choice
+        options:
+          - daily
+          - weekly
+        default: daily
 
 jobs:
   run-bot:
@@ -22,19 +30,16 @@ jobs:
       - name: Install dependencies
         run: pip install beautifulsoup4
 
-      - name: Run daily agent
-        if: github.event.schedule == '10 10 * * *' || github.event_name == 'workflow_dispatch'
-        env:
-          MESSARI_API_KEY: ${{ secrets.MESSARI_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-          COINMARKETCAP_API_KEY: ${{ secrets.COINMARKETCAP_API_KEY }}
-          CRYPTORANK_API_KEY: ${{ secrets.CRYPTORANK_API_KEY }}
-        run: python crypto_daily_agent.py --send-telegram --daily
+      - name: Resolve mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "mode=${{ github.event.schedule == '0 11 * * 0' && 'weekly' || 'daily' }}" >> $GITHUB_OUTPUT
+          else
+            echo "mode=${{ inputs.mode || 'daily' }}" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Run weekly agent
-        if: github.event.schedule == '0 11 * * 0' || github.event_name == 'workflow_dispatch'
+      - name: Run agent
         env:
           MESSARI_API_KEY: ${{ secrets.MESSARI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -42,4 +47,4 @@ jobs:
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           COINMARKETCAP_API_KEY: ${{ secrets.COINMARKETCAP_API_KEY }}
           CRYPTORANK_API_KEY: ${{ secrets.CRYPTORANK_API_KEY }}
-        run: python crypto_daily_agent.py --send-telegram --weekly
+        run: python crypto_daily_agent.py --send-telegram --${{ steps.mode.outputs.mode }}

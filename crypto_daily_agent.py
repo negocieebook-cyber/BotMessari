@@ -11,39 +11,39 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from html import unescape
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import HTTPError, URLError
+
+from lib.common import (
+    ApiResult,
+    MessariClient,
+    StateManager,
+    TelegramClient,
+    clean_markdown,
+    clean_text,
+    env_value,
+    first_number,
+    http_request,
+    load_env_file,
+    money,
+    pct,
+    pick,
+    safe_fetch,
+    single_instance_lock,
+    split_for_telegram,
+    unwrap_data,
+)
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-
-try:
-    from bs4 import BeautifulSoup
-
-    HAS_BS4 = True
-except ImportError:
-    BeautifulSoup = None
-    HAS_BS4 = False
-
 
 MESSARI_BASE = "https://api.messari.io"
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 CMC_BASE = "https://pro-api.coinmarketcap.com"
-CRYPTORANK_BASE = "https://api.cryptorank.io/v2"
 ALTERNATIVE_FNG_URL = "https://api.alternative.me/fng/?limit=1"
 BINANCE_BASE = "https://fapi.binance.com"
-TELEGRAM_BASE = "https://api.telegram.org"
-TELEGRAM_LIMIT = 4096
-SAFE_TELEGRAM_LIMIT = 3900
 DEFAULT_ASSETS = ["bitcoin", "ethereum", "solana", "hyperliquid"]
 ASSET_SLUG_ALIASES: dict[str, str] = {
     "hyperliquid": "hyperliquid",
@@ -58,7 +58,6 @@ COINGECKO_ID_MAP: dict[str, str] = {
 }
 NO_DATA = "\u26a0\ufe0f Sem dados novos dispon\u00edveis neste momento."
 SEPARATOR = "\u2501" * 25
-PLACEHOLDER_MARKERS = ("sua_chave", "sua-chave", "seu_token", "seu-token", "seu_chat", "seu-chat", "aqui")
 BINANCE_SYMBOL_MAP: dict[str, str | None] = {
     "bitcoin": "BTCUSDT",
     "ethereum": "ETHUSDT",
@@ -111,63 +110,6 @@ REGRAS:
 """
 
 
-@dataclass
-class ApiResult:
-    ok: bool
-    status: int | None
-    data: Any = None
-    error: str | None = None
-
-
-def _json_or_text(raw: str) -> Any:
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-
-
-def _error_message(data: Any, fallback: str) -> str:
-    if isinstance(data, dict):
-        for key in ("error", "message", "description", "status"):
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-            if isinstance(value, dict):
-                nested = value.get("error_message") or value.get("message")
-                if nested:
-                    return str(nested)
-    if isinstance(data, str) and data.strip():
-        return data.strip()[:300]
-    return fallback
-
-
-def http_request(
-    method: str,
-    url: str,
-    headers: dict[str, str] | None = None,
-    payload: dict[str, Any] | None = None,
-    timeout: int = 45,
-) -> ApiResult:
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request_headers = {"Accept": "application/json", "User-Agent": "CryptoDailyAgent/1.0"}
-    request_headers.update(headers or {})
-    if body is not None:
-        request_headers["Content-Type"] = "application/json"
-    request = Request(url, data=body, headers=request_headers, method=method)
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            return ApiResult(True, response.status, _json_or_text(raw))
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        parsed = _json_or_text(raw)
-        return ApiResult(False, exc.code, parsed, _error_message(parsed, str(exc.reason)))
-    except URLError as exc:
-        return ApiResult(False, None, None, str(exc.reason))
-    except TimeoutError:
-        return ApiResult(False, None, None, "Request timed out")
-
-
 def fetch_binance_funding(asset: str) -> tuple[float | None, str | None]:
     """
     Funding rate atual via Binance Futures API.
@@ -217,103 +159,6 @@ def fetch_binance_oi(asset: str) -> tuple[float | None, str | None]:
                 return oi_qty * price, None
         return oi_qty, None
     return None, f"Binance OI {symbol}: formato de resposta inesperado"
-
-
-def unwrap_data(data: Any) -> Any:
-    if isinstance(data, dict) and "data" in data:
-        return data["data"]
-    return data
-
-
-def looks_like_placeholder(value: str) -> bool:
-    lowered = value.lower()
-    return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
-
-
-def env_value(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if looks_like_placeholder(value):
-        return ""
-    return value
-
-
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-def safe_fetch(func: Callable[[], ApiResult], label: str) -> tuple[Any, str | None]:
-    """
-    Wrapper para chamadas de API. Nunca levanta exceção.
-    Retorna (data, error_message).
-    """
-    try:
-        result = func()
-        if result.ok:
-            return result.data, None
-        return None, f"\u274c {label}: status {result.status} \u2014 {result.error}"
-    except Exception as exc:
-        return None, f"\u274c {label}: {type(exc).__name__} \u2014 {exc}"
-
-
-class MessariClient:
-    def __init__(self, api_key: str, timeout: int = 45) -> None:
-        self.api_key = api_key
-        self.timeout = timeout
-
-    def _headers(self) -> dict[str, str]:
-        if not self.api_key:
-            return {}
-        return {"X-Messari-API-Key": self.api_key}
-
-    def get(self, path: str, params: dict[str, Any] | None = None) -> ApiResult:
-        if not self.api_key:
-            return ApiResult(False, None, None, "MESSARI_API_KEY ausente")
-        query = f"?{urlencode(params, doseq=True)}" if params else ""
-        result = http_request("GET", f"{MESSARI_BASE}{path}{query}", self._headers(), timeout=self.timeout)
-        time.sleep(0.5)
-        return result
-
-    def post(self, path: str, payload: dict[str, Any]) -> ApiResult:
-        if not self.api_key:
-            return ApiResult(False, None, None, "MESSARI_API_KEY ausente")
-        result = http_request("POST", f"{MESSARI_BASE}{path}", self._headers(), payload, self.timeout)
-        time.sleep(0.5)
-        return result
-
-    def asset_details(self, assets: list[str]) -> ApiResult:
-        return self.get("/metrics/v2/assets/details", {"assetIDs": ",".join(assets)})
-
-    def price_timeseries(self, asset: str, start: str, end: str) -> ApiResult:
-        return self.get(f"/metrics/v2/assets/{asset}/metrics/price/time-series/1d", {"start": start, "end": end})
-
-    def funding_rate(self, asset: str, start: str, end: str) -> ApiResult:
-        return ApiResult(False, 401, None, "endpoint requer Messari Enterprise")
-
-    def open_interest(self, asset: str) -> ApiResult:
-        return ApiResult(False, 401, None, "endpoint requer Messari Enterprise")
-
-    def volatility(self, asset: str, start: str, end: str) -> ApiResult:
-        return ApiResult(False, 401, None, "endpoint requer Messari Enterprise")
-
-    def ai_chat(self, prompt: str) -> ApiResult:
-        return self.post(
-            "/ai/v1/chat/completions",
-            {
-                "messages": [{"role": "user", "content": prompt}],
-                "verbosity": "balanced",
-                "response_format": "markdown",
-                "inline_citations": True,
-                "stream": False,
-                "generate_related_questions": 0,
-            },
-        )
 
 
 class CoinGeckoClient:
@@ -437,220 +282,6 @@ class CryptoRankClient:
                 }
             )
         return result
-
-
-class TelegramClient:
-    def __init__(self, bot_token: str, chat_id: str, timeout: int = 45) -> None:
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.timeout = timeout
-
-    def send_text(self, text: str) -> ApiResult:
-        chunks = split_for_telegram(text)
-        last_result = ApiResult(True, 200, {})
-        for chunk in chunks:
-            last_result = self._post("sendMessage", {"chat_id": self.chat_id, "text": chunk, "disable_web_page_preview": True})
-            if not last_result.ok:
-                return last_result
-        return last_result
-
-    def _post(self, method: str, payload: dict[str, Any]) -> ApiResult:
-        return http_request(
-            "POST",
-            f"{TELEGRAM_BASE}/bot{self.bot_token}/{method}",
-            {"Content-Type": "application/json"},
-            payload,
-            self.timeout,
-        )
-
-
-class StateManager:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.state = self._load()
-
-    def _load(self) -> dict[str, Any]:
-        default = {
-            "sent_funding_ids": [],
-            "sent_airdrop_ids": [],
-            "sent_research_fps": [],
-            "sent_trending_ids": [],
-            "last_run_at": "",
-            "last_fear_greed": None,
-        }
-        if not self.path.exists():
-            return default
-        try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return default
-        if not isinstance(loaded, dict):
-            return default
-        for key, value in default.items():
-            loaded.setdefault(key, value)
-        return loaded
-
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-
-    def is_new(self, bucket: str, item_id: str, ttl: timedelta) -> bool:
-        now = datetime.now(timezone.utc)
-        entries = self._fresh_entries(bucket, ttl, now)
-        self.state[bucket] = entries
-        for entry in entries:
-            if self._entry_id(entry) == item_id:
-                return False
-        return True
-
-    def remember(self, bucket: str, item_ids: list[str], ttl: timedelta) -> None:
-        now = datetime.now(timezone.utc)
-        entries = self._fresh_entries(bucket, ttl, now)
-        known = {self._entry_id(entry) for entry in entries}
-        for item_id in item_ids:
-            if item_id and item_id not in known:
-                entries.append({"id": item_id, "sent_at": now.isoformat()})
-                known.add(item_id)
-        self.state[bucket] = entries[-1000:]
-
-    def _fresh_entries(self, bucket: str, ttl: timedelta, now: datetime) -> list[Any]:
-        fresh = []
-        for entry in self.state.get(bucket, []):
-            sent_at = self._entry_time(entry)
-            if sent_at is None or now - sent_at <= ttl:
-                fresh.append(entry)
-        return fresh
-
-    @staticmethod
-    def _entry_id(entry: Any) -> str:
-        if isinstance(entry, dict):
-            return str(entry.get("id") or "")
-        return str(entry)
-
-    @staticmethod
-    def _entry_time(entry: Any) -> datetime | None:
-        if not isinstance(entry, dict):
-            return None
-        raw = entry.get("sent_at")
-        if not isinstance(raw, str) or not raw:
-            return None
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def clean_text(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text or "")
-    text = unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def clean_markdown(text: str, max_chars: int = 2600) -> str:
-    if not text:
-        return ""
-    # Remove footnotes: [^1], [1], [^12] etc
-    text = re.sub(r'\[\^?\d+\]', '', text)
-    # Remove links markdown [texto](url) mantendo só o texto
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-    # Remove headers ## Header -> linha vazia (não joga o texto fora)
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # Converte **negrito** -> texto em maiúsculas para destacar sem markdown
-    text = re.sub(r'\*\*(.+?)\*\*', lambda m: m.group(1).upper(), text)
-    # Remove * e _ e ` soltos
-    text = re.sub(r'[*_`]', '', text)
-    # Normaliza bullets para o marcador visual do Telegram.
-    text = re.sub(r'^\*\s+', '\u2022 ', text, flags=re.MULTILINE)
-    text = re.sub(r'^\-\s+', '\u2022 ', text, flags=re.MULTILINE)
-    # Remove linhas em branco excessivas
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    # Remove espaços extras
-    text = re.sub(r'[ \t]+', ' ', text)
-    return text.strip()[:max_chars]
-
-
-def first_number(*values: Any) -> float | None:
-    for value in values:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                return float(value.replace(",", ""))
-            except ValueError:
-                continue
-    return None
-
-
-def pick(data: Any, *paths: str) -> Any:
-    for path in paths:
-        current = data
-        ok = True
-        for part in path.split("."):
-            if isinstance(current, dict) and part in current:
-                current = current[part]
-            else:
-                ok = False
-                break
-        if ok and current is not None:
-            return current
-    return None
-
-
-def money(value: Any) -> str:
-    number = first_number(value)
-    if number is None:
-        return "n/d"
-    abs_value = abs(number)
-    if abs_value >= 1_000_000_000_000:
-        return f"${number / 1_000_000_000_000:.2f}T"
-    if abs_value >= 1_000_000_000:
-        return f"${number / 1_000_000_000:.2f}B"
-    if abs_value >= 1_000_000:
-        return f"${number / 1_000_000:.2f}M"
-    if abs_value >= 1:
-        return f"${number:,.2f}"
-    return f"${number:.6f}"
-
-
-def pct(value: Any) -> str:
-    number = first_number(value)
-    if number is None:
-        return "n/d"
-    return f"{number:+.2f}%"
-
-
-def avg(values: list[float]) -> float | None:
-    return sum(values) / len(values) if values else None
-
-
-def normalize_timeseries_values(data: Any) -> list[float]:
-    payload = unwrap_data(data)
-    if isinstance(payload, dict):
-        for key in ("values", "points", "series", "items"):
-            if isinstance(payload.get(key), list):
-                payload = payload[key]
-                break
-    if not isinstance(payload, list):
-        return []
-    values = []
-    for item in payload:
-        if isinstance(item, dict):
-            number = first_number(
-                item.get("value"),
-                item.get("close"),
-                item.get("price"),
-                item.get("rate"),
-                item.get("openInterest"),
-                item.get("volatility"),
-            )
-        elif isinstance(item, list):
-            number = first_number(*reversed(item))
-        else:
-            number = first_number(item)
-        if number is not None:
-            values.append(number)
-    return values
 
 
 def normalize_list(data: Any) -> list[Any]:
@@ -1225,40 +856,6 @@ def build_report(context: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def split_for_telegram(text: str) -> list[str]:
-    normalized = text.replace("\r\n", "\n")
-    if len(normalized) <= TELEGRAM_LIMIT:
-        return [normalized]
-
-    blocks = re.split(r"(?=\n?[\U0001f4ca\U0001f631\U0001f4b9\U0001f525\U0001f4c8\U0001f4c9\U0001f9e0\U0001f4b0\U0001fa82\u26a0])", normalized)
-    chunks = []
-    current = ""
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        candidate = f"{current}\n\n{block}".strip() if current else block
-        if len(candidate) <= SAFE_TELEGRAM_LIMIT:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        if len(block) <= SAFE_TELEGRAM_LIMIT:
-            current = block
-            continue
-        for line in block.splitlines():
-            candidate = f"{current}\n{line}".strip() if current else line
-            if len(candidate) <= SAFE_TELEGRAM_LIMIT:
-                current = candidate
-            else:
-                if current:
-                    chunks.append(current)
-                current = line[:SAFE_TELEGRAM_LIMIT]
-    if current:
-        chunks.append(current)
-    return chunks
-
-
 def write_report(content: str, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = f"crypto-daily-{datetime.now().date().isoformat()}.md"
@@ -1288,7 +885,8 @@ def endpoint_status(error: str | None, data: Any = None, fallback: bool = False)
     if fallback:
         return "\u26a0\ufe0f fallback usado"
     if error:
-        return error
+        # safe_fetch nao prefixa; o marcador fica centralizado aqui
+        return error if error.startswith("\u274c") else f"\u274c {error}"
     if data is None:
         return "\u274c falhou \u2014 resposta vazia"
     return "\u2705 ok"
@@ -1436,7 +1034,10 @@ def main() -> int:
             "Messari AI narrative",
         )
         _narrative_raw = extract_ai_content(narrative_data) or ""
-        narrative = clean_markdown(_narrative_raw, max_chars=2600) or NO_DATA
+        if narrative_error and "429" in str(narrative_error):
+            narrative = "\u26a0\ufe0f Limite diario da Messari AI atingido (quota reseta em ~24h). Os demais blocos nao dependem disso."
+        else:
+            narrative = clean_markdown(_narrative_raw, max_chars=2600) or NO_DATA
         endpoints["Messari AI narrative"] = endpoint_status(narrative_error, narrative_data)
         if weekly:
             funding_context = json.dumps(funding, ensure_ascii=False, default=str)
@@ -1445,6 +1046,8 @@ def main() -> int:
                 "Messari AI funding",
             )
             funding_ai = clean_markdown(extract_ai_content(funding_data) or "", max_chars=1800)
+            if funding_error and "429" in str(funding_error):
+                funding_ai = ""
             endpoints["Messari AI funding"] = endpoint_status(funding_error, funding_data)
 
     report = build_report(
@@ -1488,13 +1091,27 @@ def main() -> int:
         if args.dry_run:
             print("Dry run enabled; Telegram delivery skipped.")
         else:
+            # Registra ANTES do envio para nunca reenviar em caso de crash;
+            # se o envio falhar, desfaz o registro e permite nova tentativa.
+            pre_send_state = json.loads(json.dumps(state.state))
+            state.remember("sent_trending_ids", trending_ids, timedelta(hours=6))
+            state.remember("sent_funding_ids", funding_ids, timedelta(days=7))
+            state.remember("sent_airdrop_ids", airdrop_ids, timedelta(days=7))
+            research_fp = f"narrative|{datetime.now(timezone.utc).date().isoformat()}|{','.join(assets)}"
+            if narrative and narrative != NO_DATA:
+                state.remember("sent_research_fps", [research_fp], timedelta(days=30))
+            state.state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+            if fear_today is not None:
+                state.state["last_fear_greed"] = int(fear_today)
+            state.save()
             sent = TelegramClient(bot_token, chat_id).send_text(report)
             if not sent.ok:
                 print(f"Telegram delivery failed: {sent.error}", file=sys.stderr)
+                state.state = pre_send_state
+                state.save()
                 return 4
             print("Telegram message sent.")
-
-    if not args.dry_run:
+    elif not args.dry_run:
         state.remember("sent_trending_ids", trending_ids, timedelta(hours=6))
         state.remember("sent_funding_ids", funding_ids, timedelta(days=7))
         state.remember("sent_airdrop_ids", airdrop_ids, timedelta(days=7))
@@ -1510,4 +1127,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        with single_instance_lock("crypto_daily_agent"):
+            raise SystemExit(main())
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(5)

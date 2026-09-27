@@ -25,17 +25,28 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
-from typing import Any, Callable
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from typing import Any
+
+from lib.common import (
+    ApiResult,
+    StateManager,
+    clean_text,
+    env_status,
+    env_value,
+    http_request,
+    load_env_file,
+    single_instance_lock,
+)
 
 # ----------------------------------------------------------------------------
 # Configuracoes / fontes
@@ -147,96 +158,59 @@ HOOK_FALLBACKS: list[str] = [
 DEFAULT_ASSETS = ["bitcoin", "ethereum", "solana"]
 NO_DATA = "\u2014 sem dados \u2014"
 
+# desativa a OpenRouter dentro da execucao se a chave responder 401/403
+_OPENROUTER_DISABLED = False
+
 
 # ----------------------------------------------------------------------------
 # Helpers HTTP / state / parse (mesmo estilo do bot original)
 # ----------------------------------------------------------------------------
 
-@dataclass
-class ApiResult:
-    ok: bool
-    status: int | None
-    data: Any
-    error: str | None = None
+# Executavel do Hermes Agent (agente local com modelo proprio). Pode ser
+# sobrescrito com HERMES_BIN no .env. Se nao existir, o adaptador e pulado.
+_HERMES_CANDIDATES = [
+    shutil.which("hermes"),
+    Path.home() / "AppData/Local/hermes/hermes-agent/.hermes/bin/hermes.exe",
+    Path.home() / ".hermes/bin/hermes",
+]
+_HERMES_BIN = next((c for c in _HERMES_CANDIDATES if c and Path(c).exists()), None)
 
 
-def _error_message(data: Any, fallback: str) -> str:
-    if isinstance(data, dict):
-        msg = data.get("error") or data.get("message")
-        if isinstance(msg, str) and msg:
-            return msg
-        detail = data.get("errors")
-        if isinstance(detail, list) and detail:
-            return str(detail[0])
-    return fallback
+def hermes_chat(env: dict[str, str], system: str, user: str) -> str | None:
+    """Usa o Hermes Agent local (hermes --cli -z) como LLM. Grátis, sem chave externa.
 
-
-def http_request(
-    method: str,
-    url: str,
-    headers: dict[str, str] | None = None,
-    payload: dict[str, Any] | None = None,
-    timeout: int = 45,
-) -> ApiResult:
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req_headers = {"Accept": "application/json", "User-Agent": "XPostGenerator/1.0"}
-    req_headers.update(headers or {})
-    if body is not None:
-        req_headers["Content-Type"] = "application/json"
-    request = Request(url, data=body, headers=req_headers, method=method)
+    Retorna None se o binario nao existir, se HERMES_DISABLED=1 ou em caso de falha.
+    """
+    global _HERMES_BIN
+    if os.environ.get("HERMES_DISABLED", "").strip() == "1":
+        return None
+    if _HERMES_BIN is None:
+        override = (env.get("HERMES_BIN") or "").strip()
+        if override and Path(override).exists():
+            _HERMES_BIN = override
+        else:
+            return None
+    prompt = f"{system}\n\n---\n\n{user}"
     try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            return ApiResult(True, response.status, _json_or_text(raw))
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        return ApiResult(False, exc.code, _json_or_text(raw), _error_message(_json_or_text(raw), str(exc.reason)))
-    except URLError as exc:
-        return ApiResult(False, None, None, str(exc.reason))
-    except TimeoutError:
-        return ApiResult(False, None, None, "Request timed out")
-
-
-def _json_or_text(raw: str) -> Any:
-    try:
-        return json.loads(raw)
-    except (ValueError, TypeError):
-        return raw
-
-
-def env_value(name: str) -> str:
-    return os.environ.get(name, "").strip()
-
-
-def env_status(name: str) -> str:
-    """Diagnostico: ok / ausente / placeholder. NAO expoe a chave."""
-    v = os.environ.get(name, "").strip()
-    if not v:
-        return "AUSENTE (nao encontrada no .env)"
-    low = v.lower()
-    placeholders = ("sua-", "your-", "your_", "coloque", "placeh", "xxxx", "***", "token-do-seu", "seu-chat")
-    if any(p in low for p in placeholders):
-        return "PLACEHOLDER (parece texto de exemplo, nao chave real)"
-    return "ok"
-
-
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    try:
-        # utf-8-sig remove o BOM que o Notepad coloca no inicio do arquivo
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
-    except UnicodeDecodeError:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    for line in lines:
-        line = line.strip().lstrip("\ufeff")
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip().strip("\ufeff")
-        value = value.strip().strip("\"'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        completed = subprocess.run(
+            [str(_HERMES_BIN), "--cli", "-z", prompt],
+            capture_output=True,
+            text=True,
+            timeout=240,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"  [hermes] falhou: {type(exc).__name__}", file=sys.stderr)
+        return None
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        print(f"  [hermes] exit {completed.returncode}: {detail[-1] if detail else 'sem detalhe'}", file=sys.stderr)
+        return None
+    text = (completed.stdout or "").strip()
+    if not text:
+        return None
+    return text
 
 
 @dataclass
@@ -246,34 +220,6 @@ class NewsItem:
     url: str
     published: str
     kind: str  # news | youtube | influencer
-
-
-class StateManager:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.state: dict[str, Any] = {}
-        self._load()
-
-    def _load(self) -> None:
-        try:
-            if self.path.exists():
-                self.state = json.loads(self.path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            self.state = {}
-
-    def save(self) -> None:
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError as exc:
-            print(f"state save failed: {exc}", file=sys.stderr)
-
-
-def clean_text(text: str) -> str:
-    text = unescape(text or "")
-    text = re.sub(r"<!\[CDATA\[|\]\]>", "", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def parse_rss_feed(url: str, source: str, kind: str, limit: int = 15) -> list[NewsItem]:
@@ -570,7 +516,7 @@ def cross_reference(all_items: list[NewsItem], trend_map: dict[str, str]) -> lis
             Topic(
                 coin=coin,
                 scores=scores,
-                items=sorted(items_by_coin[coin], key=lambda it: it.published, reverse=True),
+                items=sort_items_by_recency(items_by_coin[coin]),
                 total_score=int(mom),
                 trend_rank=trend_rank,
             )
@@ -668,9 +614,14 @@ def build_context(topic: Topic, trend_map: dict[str, str]) -> str:
 
 
 def llm_chat(env: dict[str, str], system: str, user: str) -> str | None:
-    """Tenta LLM OpenAI-compatible (OPENROUTER, varios modelos), depois Messari AI, senao None."""
+    """Tenta Hermes local, depois OpenRouter, depois Messari AI; None se nada responder."""
+    global _OPENROUTER_DISABLED
+    hermes_text = hermes_chat(env, system, user)
+    if hermes_text:
+        return hermes_text
+
     key = env.get("OPENROUTER_API_KEY")
-    if key:
+    if key and not _OPENROUTER_DISABLED:
         models = [
             env.get("X_POST_MODEL"),
             "openai/gpt-4o-mini",
@@ -693,6 +644,11 @@ def llm_chat(env: dict[str, str], system: str, user: str) -> str | None:
                 },
                 timeout=60,
             )
+            if result.status in (401, 403):
+                # chave invalida: nao tenta de novo nesta rodada (nem nos proximos posts)
+                _OPENROUTER_DISABLED = True
+                print(f"  [openrouter] chave invalida ({result.status}); desativada nesta execucao", file=sys.stderr)
+                break
             if result.ok and isinstance(result.data, dict):
                 content = (result.data.get("choices") or [{}])[0].get("message", {}).get("content")
                 if content and str(content).strip():
@@ -730,59 +686,74 @@ def llm_chat(env: dict[str, str], system: str, user: str) -> str | None:
 
 
 SYSTEM_PROMPT = (
-    "You are the editor and writer for a crypto X account (@bpweb33), global audience, "
-    "native English. Your job is discernment: from the facts supplied, find the angle that is "
-    "genuinely worth a post and write it in a human voice. You are NOT a news router and do NOT "
-    "just repeat the most-mentioned topic.\n\n"
+    "You are the editor and writer of a personal crypto X account (@bpweb33), global audience, "
+    "native English. You are a person who trades and watches the tape every day, writing for "
+    "people who follow you because you share real data, not hype. Your job is discernment: from "
+    "the real facts below, find the one worth sharing and write it like a human being.\n\n"
+    "WHAT THIS ACCOUNT OFFERS:\n"
+    "- A real, specific data point and the honest reading of it. That is the whole product.\n"
+    "- Share the data like a peer, not a guru: here is what I saw, here is what it does and does "
+    "not tell us, here is what I am watching next.\n"
+    "- Say clearly when something is unknowable from the data. 'This could be rotation or it "
+    "could be exit' is a strong, honest line. Uncertainty is not weakness here.\n"
+    "- If two facts in the context pull in different directions, that tension is the post.\n\n"
+    "NEVER PROMISE. NEVER PUMP. Specifically, never write:\n"
+    "- Any price prediction, target, or implied direction of return ('will rally', 'set to pump', "
+    "'next leg', 'going to explode', 'price target').\n"
+    "- FOMO or urgency ('before it's too late', 'don't miss', 'last chance', 'getting in early', "
+    "'if you're not stacking').\n"
+    "- Investment advice or sizing ('buy the dip', 'I'm all in', 'loaded up', 'back up the truck').\n"
+    "- Certainty you do not have. If the data does not tell you why, say so.\n"
+    "- Engagement bait ('what do you think?', 'are you bullish?', 'follow for more', 'link in bio', "
+    "'drop your take'). End with substance, not a hook begging for replies.\n\n"
     "CONTENT RULES:\n"
-    "- Anchor the post in ONE real, specific fact from the context (a price, a USD amount, a "
-    "whale/flows move, a funding round, a protocol launch, a number). Be concrete and exact.\n"
-    "- NEVER invent figures. Use only what is in the context. No number in the context -> no "
-        "number in the post.\n"
-        "- Never mention internal scoring, source counts, 'confluence', or the number of feeds that "
-        "mentioned something -- write as a person sharing a thought, never as a list or a report.\n"
-        "- Write like a person who noticed one thing and shares it briefly, not a news anchor and not "
-        "a marketer.\n"
-    "- BANNED filler (never write these or their siblings): 'all over the feed today', 'worth a "
-    "closer look', \"I'll be watching\", 'trust the numbers over the chatter', 'this never happens "
-    "by chance', 'what everyone is missing', 'only time will tell', 'worth asking'.\n\n"
+    "- Anchor the post in ONE real, specific fact from the context (a USD amount, a whale move, "
+    "a funding round, a ruling, a price level). Use exact figures only from the context. No number "
+    "in the context -> no number in the post.\n"
+    "- The first sentence must do real work: either the sharpest fact or a straight reaction to it. "
+    "Never open with a formal or generic line.\n"
+    "- Never mention internal scoring, source counts, 'confluence', or how many feeds mentioned something.\n"
+    "- THE GENERIC-SENTENCE TEST: if a sentence would still make sense under a different story about "
+    "a different coin, delete it and write something that only fits THIS story.\n"
+    "- Plain words, short sentences, contractions welcome. Write the way you would text a friend "
+    "who also trades. It is fine to end with what you are watching or a real open question.\n\n"
+    "BANNED filler (never write these or their close siblings):\n"
+    "'all over the feed', 'worth a closer look', 'gets my attention', 'before I trust any take', "
+    "'markets price', 'real money tends to', 'rarely noise', 'worth noticing', 'worth noting', "
+    "'worth asking', 'the question now', \"I'll be watching\", \"I'll keep checking\", "
+    "'only time will tell', 'what everyone is missing', 'trust the numbers over the chatter', "
+    "'this never happens by chance', 'I'd rather follow the flow', 'before the narrative does', "
+    "'decides what comes next', 'carry a reason before', 'show up before', 'the trail decides', "
+    "'the signal for what's next', 'not a big narrative', 'is where the real'.\n\n"
     "VOICE to mirror (from the author's real posts):\n"
     "It's interesting how @federalreserve meetings become so significant during a bull market or a heated market...\n"
     "\n"
     "We had a meeting today, yet there wasn't even a ripple of movement regarding that.\n"
     "\n"
     "I absolutely love BTC, but this level of speculation still worries me\n"
-    "Traits to mirror: observant, honest (name the worry/caution), a touch of skepticism, plain "
-    "words, concise.\n\n"
-    "EXAMPLE of the right tone (specific fact, a little dry):\n"
-    "Almost every on-chain tracker logged the same thing an hour ago...\n"
-    "\n"
-    "A whale that was dormant for 600 days just moved $52M in PEPE to a new address.\n"
-    "\n"
-    "Whether that lands on an exchange is the part I'll keep checking.\n\n"
-    "FORMAT (loose, not a rigid template):\n"
-    "- ~270 characters total (free X plan).\n"
-    "- Up to 3 short paragraphs separated by BLANK lines.\n"
-        "- Vary where the fact lands (fact first, or thought first and the fact second) -- your call.\n"
-        "- Every paragraph is a complete thought; do NOT end a paragraph mid-sentence on a dangling "
-        "\"...\". End cleanly even when the thought is open-ended.\n"
-        "- English only. No emojis, no hashtags, no ALL-CAPS.\n"
+    "Traits: observant, honest about doubt, a little skeptical, concise, no hype words.\n\n"
+    "VARY THE SHAPE (never the same skeleton twice in one run):\n"
+    "a) fact first, then what it does and does not tell you\n"
+    "b) short reaction first ('Honestly...', 'Not sure how to read this'), then the fact\n"
+    "c) the fact, then the honest fork: the two things it could mean\n"
+    "d) two facts from the context, then the tension between them\n\n"
+    "DISCUSSION HOOK (only when the user prompt asks for one, roughly every other post):\n"
+    "- End with a real invitation to disagree: a specific question or a mildly provocative take "
+    "you are willing to defend about THIS story.\n"
+    "- The hook must be story-specific ('Where does this land next - exchange, or cold storage?', "
+    "'I don't buy the panic read here. Tell me what I'm missing.') -- never generic ('thoughts?', "
+    "'what do you think?', 'are you bullish?').\n"
+    "- Provocative is fine. Reckless is not: the hook can challenge a narrative, never promise a "
+    "direction.\n\n"
+    "FORMAT: ~270 characters total (free X plan), up to 3 short paragraphs separated by BLANK lines, "
+    "every paragraph a complete thought with a clean ending (no dangling '...'). English only. "
+    "No emojis, no hashtags, no ALL-CAPS.\n\n"
+    "EXAMPLE of the right tone:\n"
+    "Almost every on-chain tracker logged the same thing an hour ago.\n\n"
+    "A whale that sat still for 600 days just moved $52M in PEPE to a fresh address.\n\n"
+    "No exchange deposit yet. I can't tell you why from here, but the trail is public if you want to follow it.\n"
 )
 
-
-_MID_VARIANTS = [
-    "Moves that size usually carry a reason before the headline does.",
-    "That scale of flow is the part markets price before most people look.",
-    "This is where real money tends to show up before the narrative does.",
-    "Discrepancies this big are rarely noise.",
-    "A move this size gets my attention before I trust any take.",
-]
-_TAIL_VARIANTS = [
-    "I'd rather follow the flow than the hype for {name}",
-    "I watch moves like this before I ever buy the story for {name}",
-    "How {name} holds from here will tell you more than any take",
-    "Whether {name} can hold that level is the question now",
-]
 
 # Frases-coringa que matam a voz humana. Usadas para (a) proibir o modelo de repetir
 # e (b) gate de qualidade pós-geração com 1 re-geração.
@@ -798,6 +769,46 @@ FILLER_PATTERNS = [
     r"caught my attention",
     r"worth noticing",
     r"worth noting",
+    r"gets? my attention",
+    r"before i trust any take",
+    r"real money tends to",
+    r"rarely noise",
+    r"decides what comes next",
+    r"the question now",
+    r"the part that matters",
+    r"i'?d rather follow the flow",
+    r"before the narrative does",
+    r"carry a reason before",
+    r"show up before the narrative",
+    r"gets? my attention before",
+    r"i watch moves like this",
+    # promessa / pump / conselho financeiro / engagement bait
+    r"price target",
+    r"to the moon",
+    r"before it'?s too late",
+    r"don'?t miss",
+    r"last chance",
+    r"getting in early",
+    r"next (leg|stop)",
+    r"set to (pump|rally|explode)",
+    r"going to (explode|moon|pump|rally)",
+    r"will (explode|moon|pump)",
+    r"i'?m all in",
+    r"loaded up",
+    r"back up the truck",
+    r"buy the dip",
+    r"guaranteed",
+    r"are you (bullish|bearish|in\b)",
+    r"what do you think",
+    r"follow for more",
+    r"link in bio",
+    r"drop your",
+    r"insiders? are (loading|accumulating|buying)",
+    r"you'?re not stacking",
+    r"opportunity of a lifetime",
+    r"the trail decides",
+    r"signal for what'?s next",
+    r"not a big narrative",
     # vazamento de metadados internos (score/confluencia/fontes) que nunca podem ir no post
     r"\d+\s*pts?\b",
     r"\d+\s*sources?\b",
@@ -843,26 +854,135 @@ def _human_name(topic: Topic) -> str:
     return topic.coin
 
 
-def template_post(topic: Topic) -> str:
-    """Fallback sem IA: usa FATO real do topico, com frases variadas (sem repetir entre posts)."""
+def _best_flow_item(topic: Topic) -> NewsItem | None:
     best = None
     bm = -1.0
     for it in topic.items:
         mag = flow_magnitude_usdm(it.title)
         if mag > bm:
             best, bm = it, mag
+    if best is not None and bm > 0:
+        return best
+    return topic.items[0] if topic.items else None
+
+
+_TIME_TAIL = re.compile(r"(?:\s*\d+(?:\.\d+)?\s*(?:hours?|hrs?|minutes?|mins?|days?|weeks?)\s*ago|\s*\bago|\s*\d+)$", re.I)
+
+
+def _compact_fact(item: NewsItem) -> str:
+    """Titular limpa e curta: corta em elemento completo (parenteses/clausula),
+    remove fragmentos de tempo soltos e fecha aspas penduradas."""
+    t = clean_text(item.title)
+    t = re.sub(r"\s+", " ", t).strip().strip('"').strip()
+    t = t.rstrip(".!?…")
+    if len(t) > 150:
+        window = t[:150]
+        cut = -1
+        for sep in (") ", ", ", " - ", "; ", ". "):
+            c = window.rfind(sep)
+            if c >= 60 and c > cut:
+                cut = c
+        if cut >= 0:
+            t = window[: cut + 1]  # mantem o separador completo (")", ",", "-")
+        else:
+            t = window.rsplit(" ", 1)[0]
+    # fragmentos de tempo soltos (ex: "... million) 9 hours ago" cortado no limite)
+    while True:
+        m = _TIME_TAIL.search(t)
+        if not m or not m.group(0):
+            break
+        match_text = m.group(0).strip()
+        if match_text.isdigit() and m.start() > 0 and t[m.start() - 1] in (",", "."):
+            break  # numero legitimo de milhar/decimal no fim, nao fragmento
+        t = t[: m.start()].rstrip(" ,;-(")
+    # parenteses/aspas abertas e nunca fechadas = fragmento inutil, remove
+    if t.count("(") > t.count(")"):
+        t = t[: t.rfind("(")].rstrip(" ,;-")
+    if t.count('"') % 2 == 1:
+        t = t[: t.rfind('"')].rstrip(" ,;-")
+    t = t.rstrip(",;-: ")
+    if t:
+        t = t[0].upper() + t[1:]
+        t += "."
+    return t
+
+
+# Observacoes de acompanhamento por tipo de fonte. Honestas sobre incerteza,
+# sem promessa, especificas o suficiente para sobreviver ao teste de genericidade.
+_FOLLOWUPS_BY_KIND: dict[str, list[str]] = {
+    "flow": [
+        "Doesn't tell you why yet. The deposit address will, when it moves again.",
+        "Could be rotation, could be exit. I can't tell you which from here.",
+        "No exchange deposit so far. The trail is public if you want to follow it.",
+    ],
+    "news": [
+        "Second read on this will matter more than the first.",
+        "Counterparties react slower than headlines. Watch what they actually do.",
+        "The text is one thing. Who has to comply with it is the other.",
+    ],
+    "youtube": [
+        "Video takes move faster than data confirms.",
+        "Thumbnails argue. Charts settle.",
+    ],
+    "influencer": [
+        "Big accounts talk. Wallets tell.",
+        "Take it as sentiment data, not as a signal.",
+    ],
+}
+
+
+# Ganchos de discussao por tipo de fonte: pergunta/take provocador porem
+# especifico da historia, sem promessa. Usados alternadamente, nao em todo post.
+_HOOKS_BY_KIND: dict[str, list[str]] = {
+    "flow": [
+        "Where does this land next - exchange, or back to cold storage?",
+        "If this is a plan, it's a patient one. Anyone reading it differently?",
+        "I don't see panic in an address like this. Tell me what I'm missing.",
+    ],
+    "news": [
+        "Who actually gets squeezed if this holds?",
+        "The size is the headline. The counterparty is the part nobody is watching yet.",
+        "I read this as slow-motion, not breaking news. Disagree?",
+    ],
+    "youtube": [
+        "The tape disagrees with the timeline. Who do you trust more?",
+        "Bold claims from big channels. The chart will say who was right.",
+    ],
+    "influencer": [
+        "Big accounts talk. Wallets tell. I know which one I watch.",
+        "Louder than the data right now. That usually evens out.",
+    ],
+}
+
+
+def template_post(
+    topic: Topic,
+    used_followups: set[str] | None = None,
+    with_hook: bool = False,
+) -> str:
+    """Fallback sem IA: fato real do topico + observacao honesta (sem promessa) por tipo de fonte.
+
+    `used_followups` evita repetir observacao na mesma rodada; `with_hook` troca a
+    observacao por um gancho de discussao (alternado, nao em todo post).
+    """
+    used_followups = used_followups if used_followups is not None else set()
+    best = _best_flow_item(topic)
     name = _human_name(topic)
+    if best is None:
+        return (
+            f"{name} keeps moving without a clean reason on the tape.\n\n"
+            "I'd rather wait for the numbers than guess the story."
+        )
     h = 0
     for ch in topic.coin:
         h = (h * 31 + ord(ch)) % 100000
-    mid = _MID_VARIANTS[h % len(_MID_VARIANTS)]
-    tail = _TAIL_VARIANTS[(h // 7) % len(_TAIL_VARIANTS)].format(name=name)
-    if best is not None and bm > 0:
-        return f"{best.title.rstrip().rstrip('.')}...\n\n{mid}\n\n{tail}"
-    item = topic.items[0] if topic.items else None
-    if item:
-        return f"{item.title.rstrip().rstrip('.')}...\n\nCaught my attention around {name}.\n\n{tail}"
-    return f"{name} just made a move worth noticing...\n\nChecking the data before I say anything clever.\n\nI'll wait for confirmation"
+    pool = _HOOKS_BY_KIND if with_hook else _FOLLOWUPS_BY_KIND
+    followups = pool.get(best.kind, pool["news"])
+    ordered = followups[h % len(followups):] + followups[: h % len(followups)]
+    followup = next((f for f in ordered if f not in used_followups), ordered[0])
+    used_followups.add(followup)
+    post = f"{_compact_fact(best)}\n\n{followup}"
+    return truncate_post(post)
 
 
 def _best_fact_line(topic: Topic) -> str:
@@ -930,6 +1050,30 @@ def truncate_post(text: str, hard: int = 297) -> str:
 
 def generate_posts(topics: list[Topic], env: dict[str, str], limit: int = 2) -> list[tuple[Topic, str]]:
     posts: list[tuple[Topic, str]] = []
+    previous: list[str] = []
+
+    def build_user_prompt(ctx: str, retry_note: bool) -> str:
+        vary = ""
+        if previous:
+            vary = (
+                "\n\nPosts already written this run (do NOT reuse their skeleton, opener, "
+                "or phrasing):\n" + "\n".join(f"- {p}" for p in previous)
+            )
+        if retry_note:
+            return (
+                "Contexto (so dados reais):\n" + ctx + vary
+                + "\n\nYour previous draft had a problem: too long, empty filler, dangling ending, "
+                  "a sentence that would fit any other story, or (worst of all) a promise/prediction/urgency "
+                  "line that this account never makes. Rewrite the SAME idea tighter: UNDER 270 characters, "
+                  "no sentence that could apply to a different coin, real numbers from the context only, "
+                  "no price predictions, no FOMO, no advice, no engagement-bait questions -- just the data "
+                  "and the honest reading. Every paragraph a complete thought with a clean ending, shape "
+                  "different from any previous post. Post text only. If you still cannot, reply exactly: SKIP"
+            )
+        return (
+            "Contexto (so dados reais):\n" + ctx + vary
+            + "\n\nWrite 1 finished post now. Output the post text only -- no intro, no quotes, no labels."
+        )
 
     # Escolha editorial (discernimento): LLM elege os temas por interesse/substancia.
     order = pick_topics_via_llm(env, topics, want=limit, k=min(6, len(topics)))
@@ -937,40 +1081,30 @@ def generate_posts(topics: list[Topic], env: dict[str, str], limit: int = 2) -> 
         # sem chave/LLM indisponivel -> ordem de confluencia (fallback original)
         order = list(range(min(len(topics), limit * 3)))
 
+    used_followups: set[str] = set()
+    post_position = 0
     for idx in order:
         if idx >= len(topics) or len(posts) >= limit:
             continue
         topic = topics[idx]
-        ctx = build_context(topic, {})
-        text = llm_chat(
-            env,
-            SYSTEM_PROMPT,
-            "Contexto (so dados reais):\n" + ctx
-            + "\n\nWrite 1 finished post now. Output the post text only -- no intro, no quotes, no labels.",
+        with_hook = post_position % 2 == 1  # provocacao alternada: nem todo post
+        hook_note = (
+            "\n\nEnd this post with the DISCUSSION HOOK: one specific question or mildly provocative "
+            "take about THIS story, per the system rules. No generic hooks."
+            if with_hook
+            else ""
         )
+        ctx = build_context(topic, {})
+        text = llm_chat(env, SYSTEM_PROMPT, build_user_prompt(ctx, retry_note=False) + hook_note)
         if text is None:
-            text = template_post(topic)
+            text = template_post(topic, used_followups, with_hook=with_hook)
         elif text.strip().upper() == "SKIP":
             continue
         text = text.strip().strip('"').strip()
 
-        if (
-            has_filler(text)
-            or _dangling_end(text)
-            or len(text) > 285
-        ):
-            # gate de qualidade: 1 re-geracao sem frase-coringa, sem final cortado,
-            # e respeitando o limite de ~270-285 chars (evita truncamento via corte)
-            retry = llm_chat(
-                env,
-                SYSTEM_PROMPT,
-                "Contexto (so dados reais):\n" + ctx
-                + "\n\nYour previous draft was too long (over ~285 characters), used empty filler "
-                  "phrases, and/or ended mid-thought on a dangling '...'. Rewrite the SAME idea tighter: "
-                  "UNDER 270 characters, specific concrete language, real numbers, no meta-commentary, "
-                  "every paragraph a complete thought with a clean ending. Post text only. If you still "
-                  "cannot, reply exactly: SKIP",
-            )
+        if has_filler(text) or _dangling_end(text) or len(text) > 285:
+            # gate de qualidade: 1 re-geracao com regras mais duras
+            retry = llm_chat(env, SYSTEM_PROMPT, build_user_prompt(ctx, retry_note=True) + hook_note)
             if retry and retry.strip().upper() != "SKIP":
                 text = retry.strip().strip('"').strip()
 
@@ -978,7 +1112,9 @@ def generate_posts(topics: list[Topic], env: dict[str, str], limit: int = 2) -> 
         text = _strip_dangling_ellipsis(text)
         text = truncate_post(text)
         text = _strip_dangling_ellipsis(text)
+        previous.append(text.replace("\n\n", " / ")[:140])
         posts.append((topic, text))
+        post_position += 1
     return posts
 
 
@@ -1018,12 +1154,34 @@ def parse_args() -> argparse.Namespace:
 
 
 # ----------------------------------------------------------------------------
-# Deduplicacao por historia (evita repostar o mesmo fato/coin dias a fio)
-# ----------------------------------------------------------------------------
+# Deduplicacao por historia (evita repostar o mesmo fato/coin dias a fio).
+# A comparacao e por SIMILARIDADE de tokens (sem considerar a fonte), entao a
+# mesma historia contada por outlets diferentes tambem e detectada.
+
+STOP_TOKENS = frozenset(
+    """the and for with from this that will has have its are was were after over into
+    out new now just get got all one two amid via more most than then them they
+    whats today report reports news says said as at by on in of to a an is be it""".split()
+)
+
+_SIMILARITY_THRESHOLD = 0.65
+
+
+def _title_tokens(title: str) -> set[str]:
+    words = re.findall(r"[a-z0-9$#]+", (title or "").lower())
+    return {w for w in words if len(w) > 2 and w not in STOP_TOKENS}
+
 
 def _story_fingerprint(item: NewsItem) -> str:
-    base = re.sub(r"[^a-z0-9]+", "", (item.title or "").lower()).strip()
-    return f"{item.source}|{base}" if base else ""
+    return " ".join(sorted(_title_tokens(item.title)))
+
+
+def _title_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
+    if not tokens_a or not tokens_b:
+        return 0.0
+    if tokens_a == tokens_b:
+        return 1.0
+    return len(tokens_a & tokens_b) / min(len(tokens_a), len(tokens_b))
 
 
 def _within_hours(ts: str, now: datetime, hours: int) -> bool:
@@ -1034,16 +1192,70 @@ def _within_hours(ts: str, now: datetime, hours: int) -> bool:
     return (now - t) < timedelta(hours=hours)
 
 
-def _recent_stories(state: StateManager, hours: int = 36) -> set[str]:
+def _recent_stories(state: StateManager, hours: int = 36) -> list[set[str]]:
     now = datetime.now(timezone.utc)
     recent = state.state.get("posted_fps", {})
-    return {fp for fp, ts in recent.items() if _within_hours(ts, now, hours)}
+    tokens_list = []
+    for fp, ts in recent.items():
+        if _within_hours(ts, now, hours):
+            tokens_list.append(set(fp.split()))
+    return tokens_list
+
+
+def _is_repeat(recent_tokens: list[set[str]], item: NewsItem) -> bool:
+    tokens = _title_tokens(item.title)
+    if not tokens:
+        return False
+    return any(_title_similarity(tokens, other) >= _SIMILARITY_THRESHOLD for other in recent_tokens)
 
 
 def _prune_stories(state: StateManager, hours: int = 48) -> None:
     now = datetime.now(timezone.utc)
     recent = state.state.get("posted_fps", {})
     state.state["posted_fps"] = {fp: ts for fp, ts in recent.items() if _within_hours(ts, now, hours)}
+
+
+def parse_pub_date(raw: str) -> datetime | None:
+    """Converte datas de RSS/Atom (RFC822, ISO, etc.) em datetime UTC. None se falhar."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is not None:
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        pass
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def item_age_hours(item: NewsItem, now: datetime | None = None) -> float | None:
+    parsed = parse_pub_date(item.published)
+    if parsed is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return (now - parsed).total_seconds() / 3600.0
+
+
+def sort_items_by_recency(items: list[NewsItem]) -> list[NewsItem]:
+    """Ordena por data real parseada (mais nova primeiro); sem data, mantem ordem no fim."""
+    def sort_key(index_item: tuple[int, NewsItem]):
+        index, item = index_item
+        parsed = parse_pub_date(item.published)
+        if parsed is None:
+            return (1, 0.0, index)
+        return (0, -parsed.timestamp(), index)
+    return [item for _, item in sorted(enumerate(items), key=sort_key)]
 
 
 def main() -> int:
@@ -1053,7 +1265,10 @@ def main() -> int:
     print("  [env] TELEGRAM_BOT_TOKEN:", env_status("TELEGRAM_BOT_TOKEN"))
     print("  [env] TELEGRAM_CHAT_ID:", env_status("TELEGRAM_CHAT_ID"))
     args = parse_args()
+    # env com placeholders filtrados: evita usar chave de exemplo como real
     env = dict(os.environ)
+    for name in ("OPENROUTER_API_KEY", "MESSARI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        env[name] = env_value(name)
 
     state = StateManager(Path(args.state_file))
 
@@ -1076,6 +1291,14 @@ def main() -> int:
             print(f"  [x] @{handle}: {len(items)} tweets")
             all_items.extend(items)
 
+    # Descarta itens com data parseavel muito antiga (news velha nao merece post)
+    max_age_hours = 72
+    before_count = len(all_items)
+    all_items = [it for it in all_items if item_age_hours(it) is None or item_age_hours(it) <= max_age_hours]
+    dropped = before_count - len(all_items)
+    if dropped:
+        print(f"  [idade] {dropped} itens com mais de {max_age_hours}h descartados")
+
     print("Sinais de mercado (CoinGecko trending)...")
     trend_map = coingecko_trending_by_id()
     print(f"  [cg] {len(trend_map)} moedas em trending")
@@ -1095,11 +1318,11 @@ def main() -> int:
         rank = f" | trending #{t.trend_rank}" if t.trend_rank else ""
         print(f"  {t.total_score} pts {t.coin}{rank}: {', '.join(f'{k} {v}x' for k, v in sorted(t.scores.items(), key=lambda kv: -kv[1]))}")
 
-    # Nao repostar historias ja entregues nas ultimas ~36h: o editor passa a
-    # escolher algo fresco em vez de repetir o mesmo fato/coin em toda rodada.
+    # Nao repostar historias ja entregues nas ultimas ~36h (comparacao por
+    # similaridade de tokens, entre fontes): o editor escolhe algo fresco.
     recent = _recent_stories(state)
     if recent:
-        fresh = [t for t in topics if not any(_story_fingerprint(it) in recent for it in t.items[:4])]
+        fresh = [t for t in topics if not any(_is_repeat(recent, it) for it in t.items[:4])]
         if fresh:
             topics = fresh
 
@@ -1133,7 +1356,6 @@ def main() -> int:
             if fp:
                 state.state["posted_fps"][fp] = datetime.now(timezone.utc).isoformat()
     _prune_stories(state)
-
     md_path.write_text("\n".join(md_lines), encoding="utf-8")
     json_path.write_text(json.dumps(payload_saved, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nPosts salvos em {md_path}")
@@ -1156,4 +1378,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        with single_instance_lock("x_generator"):
+            raise SystemExit(main())
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(5)
